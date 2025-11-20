@@ -243,9 +243,8 @@ def get_dataloaders(config, rank=None, world_size=None):
         dataset = load_wikitext_from_local(config.local_dataset_dir)
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset_name}")
-
     def tokenize_function(examples, tokenizer, max_length):
-        # 使用相同的文本作为输入和标签
+        # Use the same text for both input and labels
         tokenized_inputs = tokenizer(
             examples["text"], 
             truncation=True, 
@@ -254,25 +253,24 @@ def get_dataloaders(config, rank=None, world_size=None):
             return_tensors="pt"
         )
         
-        # 添加labels字段
+        # Add labels field
         tokenized_inputs["labels"] = tokenized_inputs["input_ids"].clone()
 
-        # 2. 这里的关键点：利用 attention_mask 将 padding 的部分设置为 -100
-        # tokenizer 返回的 attention_mask 中，1 代表有效 token，0 代表 padding
-        # 注意：因为是在 dataset.map 中 batched=True，这里的数据是 Tensor 或者是 List of Lists
-        # 为了安全起见，我们使用 torch 操作（因为你在 return_tensors="pt"）
+        # Key operation: Set padding tokens to -100 using attention_mask
+        # In attention_mask: 1=valid token, 0=padding
+        # Note: With batched=True in dataset.map, data is Tensor/list of lists
+        # Using torch operations (since return_tensors="pt")
         
-        # 如果 tokenizer 返回的是 Tensor (因为 return_tensors="pt")
         labels = tokenized_inputs["labels"]
         attention_mask = tokenized_inputs["attention_mask"]
         
-        # 将 mask 为 0 的位置 (padding) 的 label 设为 -100
-        # 这样 CrossEntropyLoss 就会自动忽略这些位置
+        # Set padding positions (mask=0) to -100 in labels
         labels[attention_mask == 0] = -100
         
-        # 重新赋值回去
+        # Update labels
         tokenized_inputs["labels"] = labels
         return tokenized_inputs
+
     def preprocess(examples):
         return tokenize_function(examples, tokenizer, config.max_length)
         

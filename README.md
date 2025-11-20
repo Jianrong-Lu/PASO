@@ -1,6 +1,6 @@
 # PASO: Step-Parallel Training
 
-**PASO** is the first accuracy-free, step-parallel training method based on equation system solving. By reformulating the optimization process as a fixed-point problem, PASO breaks the sequential dependency of standard optimizers, allowing for **significant acceleration in training throughput** without sacrificing model accuracy.
+**PASO** is the first step-parallel training method based on equation system solving. By reformulating the optimization process as a fixed-point problem, PASO breaks the sequential dependency of standard optimizers, allowing for **significant acceleration in training** without sacrificing model accuracy.
 
 -----
 
@@ -85,14 +85,19 @@ python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelsc
 **PASO Training:**
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode serial --P 7
+python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.9 --training_mode serial --P 7
 ```
-**Data-Parallel Training:**
+**Naive Data-Parallel Training:**
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode ddp 
+python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode navie_dp 
 ```
 
+**Pytorch's Data-Parallel Training:**
+
+```bash
+python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode ddp 
+```
 
 #### B. Legacy Version (`llm_v1.py`)
 
