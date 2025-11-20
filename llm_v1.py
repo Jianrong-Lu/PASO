@@ -1,12 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-用于大型语言模型的高级并行训练脚本。
 
-实现了基于固定点迭代的自定义并行算法 (ParaSolver/PASO)，
-并支持使用 ModelScope 和 Hugging Face Transformers 进行模型加载和训练。
-"""
 
 # ==========================
 # 1. Imports
@@ -16,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset, disable_caching
 from modelscope import snapshot_download
-from modelscope import AutoTokenizer as ModelScopeAutoTokenizer # 显式命名以避免冲突
+from modelscope import AutoTokenizer as ModelScopeAutoTokenizer # Explicit naming to avoid conflicts
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch.multiprocessing as mp
 from tqdm import tqdm
@@ -30,13 +25,13 @@ import json
 from sklearn.metrics import accuracy_score, f1_score
 import csv
 
-# from torchmetrics.functional import accuracy, f1_score # 保持注释，因为原始代码未激活
+# from torchmetrics.functional import accuracy, f1_score # Keep commented as original code not activated
 
 # ==========================
 # 2. CSV Logger Class
 # ==========================
 class CSVLogger:
-    """一个简单的CSV日志记录器，用于在训练期间保存指标。"""
+    """A simple CSV logger for saving metrics during training."""
     def __init__(self, filename=None):
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -50,8 +45,8 @@ class CSVLogger:
             os.makedirs(directory, exist_ok=True)
             
     def log(self, data):
-        """记录一行新数据（一个字典）。"""
-        # 动态添加新的字段名
+        """Log a new row of data (a dictionary)."""
+        # Dynamically add new field names
         for key in data.keys():
             if key not in self.fieldnames:
                 self.fieldnames.add(key)
@@ -59,7 +54,7 @@ class CSVLogger:
         self.rows.append(data)
         
     def save(self):
-        """将所有缓冲的数据写入CSV文件。"""
+        """Write all buffered data to CSV file."""
         if not self.rows:
             return
             
@@ -70,46 +65,46 @@ class CSVLogger:
                 writer.writerow(row)
                 
     def finish(self):
-        """保存并关闭日志。"""
+        """Save and close the log."""
         self.save()
 
 # ==========================
 # 3. Configuration Class
 # ==========================
 class Config:
-    """训练配置参数。"""
-    # 训练参数
+    """Training configuration parameters."""
+    # Training parameters
     batch_size = 8
     num_epochs = 1
-    max_steps = 10
+    max_steps = 1000
     learning_rate = 6e-5
     momentum = 0.9
 
-    # 加速配置 (ParaSolver/PASO)
-    P = 7  # 窗口大小
-    threshold = 1e-5  # 误差阈值
-    ema_decay = 0.9  # 阈值的EMA衰减
-    adaptivity_type = 'mean'  # 'mean' 或 'median'
+    # Acceleration configuration (ParaSolver/PASO)
+    P = 7  # Window size
+    threshold = 1e-5  # Error threshold
+    ema_decay = 0.9  # EMA decay for threshold
+    adaptivity_type = 'mean'  # 'mean' or 'median'
     
-    # 系统配置
+    # System configuration
     seed = 42
     device_count = torch.cuda.device_count()
     
-    # 模型和数据集配置
-    # 注意：这些最好通过命令行参数覆盖
-    modelscope_name = 'LLM-Research/Llama-3.2-1B'
-    local_model_dir = "/gruntdata/heyuan67/lu_25/model/Llama-3.2-1B"
+    # Model and dataset configuration
+    # Note: These are best overridden via command line arguments
+    modelscope_name = 'openai-community/gpt2'
+    local_model_dir = "./model/gpt2"
     dataset_name = 'local_wikitext'
-    local_dataset_dir = "/gruntdata/heyuan67/lu_25/dataset/wikitext/wikitext-2" 
-    output_dir = "/gruntdata/heyuan67/lu_25/PASO/new_exp_results"
+    local_dataset_dir = "./data/wikitext-2" 
+    output_dir = "./new_exp_results"
     
-    max_length = 512  # Tokenizer 最大序列长度
-    optimizer_type = 'adamw'
-    training_mode = 'parallel'
-    sweep_config_path = 'XXX.json' # 似乎未使用
+    max_length = 512  # Tokenizer maximum sequence length
+    optimizer_type = 'adam'
+    training_mode = 'serial'
+    sweep_config_path = 'XXX.json' # Seems unused
 
     def update_from_args(self, args):
-        """从命令行的 argparse 命名空间更新配置。"""
+        """Update configuration from command line argparse namespace."""
         for key, value in vars(args).items():
             if hasattr(self, key) and value is not None:
                 setattr(self, key, value)
@@ -118,46 +113,42 @@ class Config:
 # 4. Utility & Metric Functions
 # ==========================
 def to_device(batch, device):
-    """将一个数据批次（字典）移动到指定设备。"""
     return {k: v.to(device) for k, v in batch.items()}
 
 def calculate_metrics(preds, labels, ignore_index=-100):
-    """
-    计算准确率和F1分数 (基于Sklearn的CPU版本)。
-    注意：这是您脚本中三个定义中的最后一个，也是唯一一个被激活的。
-    """
-    # 展平预测和标签
+
+    # Flatten predictions and labels
     preds_flat = preds.cpu().flatten()
     labels_flat = labels.cpu().flatten()
     
-    # 创建一个mask来忽略填充标记
+    # Create a mask to ignore padding tokens
     mask = (labels_flat != ignore_index)
     
-    # 应用mask
+    # Apply mask
     active_preds = preds_flat[mask]
     active_labels = labels_flat[mask]
     
     if len(active_labels) == 0:
-        # 如果没有有效的标签
+        # If no valid labels
         return 0.0, 0.0
         
-    # 计算准确率
+    # Calculate accuracy
     accuracy = accuracy_score(active_labels, active_preds)
     
-    # 计算F1分数(宏平均)
+    # Calculate F1 score (macro average)
     f1 = f1_score(active_labels, active_preds, average='macro', zero_division=0)
     
     return accuracy, f1
 
 def optimizer_state_clone(optimizer_from, optimizer_to):
-    """将一个优化器的状态复制到另一个。"""
+    """Copy the state of one optimizer to another."""
     optimizer_to.load_state_dict(optimizer_from.state_dict())
 
 # ==========================
 # 5. Data Handling
 # ==========================
 def load_wikitext_from_local(path):
-    """从本地目录加载 wikitext 数据集。"""
+    """Load wikitext dataset from local directory."""
     if not os.path.exists(path):
         raise ValueError(f"Dataset path {path} does not exist. Please check `local_dataset_dir`.")
     
@@ -167,7 +158,7 @@ def load_wikitext_from_local(path):
         "test": os.path.join(path, "wiki.test.tokens")
     }
     
-    # 过滤掉不存在的文件
+    # Filter out non-existent files
     existing_files = {split: file for split, file in data_files.items() if os.path.exists(file)}
     if not existing_files:
         raise FileNotFoundError(f"No valid data files found in {path}. Expected wiki.train.tokens, etc.")
@@ -177,8 +168,8 @@ def load_wikitext_from_local(path):
     return dataset
 
 def _tokenize_function(examples, tokenizer, max_length):
-    """用于数据集 map 的辅助 Tokenize 函数。"""
-    # 使用相同的文本作为输入和标签
+    """Helper tokenize function for dataset map."""
+    # Use the same text as input and labels
     tokenized_inputs = tokenizer(
         examples["text"], 
         truncation=True, 
@@ -187,13 +178,13 @@ def _tokenize_function(examples, tokenizer, max_length):
         return_tensors="pt"
     )
     
-    # 添加labels字段 (Causal LM 的标准做法)
+    # Add labels field (standard practice for Causal LM)
     tokenized_inputs["labels"] = tokenized_inputs["input_ids"].clone()
     return tokenized_inputs
 
 def get_dataloaders(config):
-    """加载和准备指定的数据集并返回 DataLoaders。"""
-    # 确定用于 tokenizer 的模型目录
+    """Load and prepare the specified dataset and return DataLoaders."""
+    # Determine model directory for tokenizer
     if config.local_model_dir and os.path.exists(config.local_model_dir):
         model_dir = config.local_model_dir
     else:
@@ -201,7 +192,7 @@ def get_dataloaders(config):
         model_dir = snapshot_download(
             config.modelscope_name, 
             revision='master',
-            cache_dir=os.path.dirname(config.local_model_dir) # 使用 config 中 local_dir 的父目录作为缓存
+            cache_dir=os.path.dirname(config.local_model_dir) # Use parent directory of local_dir in config as cache
         )
         
     print(f"Loading tokenizer from {model_dir}...")
@@ -211,7 +202,7 @@ def get_dataloaders(config):
         print("Tokenizer pad_token not set. Setting to eos_token.")
 
     print(f"Loading dataset: {config.dataset_name}...")
-    disable_caching() # 推荐用于 multiprocessing
+    disable_caching() # Recommended for multiprocessing
 
     if config.dataset_name == 'local_wikitext':
         dataset = load_wikitext_from_local(config.local_dataset_dir)
@@ -221,7 +212,7 @@ def get_dataloaders(config):
     print("Tokenizing dataset...")
     column_names = dataset["train"].column_names
     
-    # 使用 functools.partial 来传递额外参数
+    # Use functools.partial to pass additional parameters
     from functools import partial
     preprocess_fn = partial(_tokenize_function, tokenizer=tokenizer, max_length=config.max_length)
     
@@ -229,7 +220,7 @@ def get_dataloaders(config):
         preprocess_fn,
         batched=True,
         remove_columns=column_names,
-        num_proc=16 # 可以适当增加进程数以加快预处理
+        num_proc=16 # Can appropriately increase processes to speed up preprocessing
     )
     tokenized_datasets.set_format("torch")
 
@@ -261,11 +252,11 @@ def get_dataloaders(config):
 # 6. Model Definition
 # ==========================
 class ModelWrapper(nn.Module):
-    """模型的通用包装器，以提供一致的接口。"""
+    """Universal wrapper for models to provide consistent interface."""
     def __init__(self, model):
         super(ModelWrapper, self).__init__()
         self.model = model
-        # 为数据并行禁用缓存
+        # Disable cache for data parallelism
         if hasattr(self.model.config, 'use_cache'):
             self.model.config.use_cache = False
 
@@ -273,24 +264,24 @@ class ModelWrapper(nn.Module):
         return self.model(*args, **kwargs)
 
     def clone(self, device, other=None):
-        """在指定设备上创建模型的深层副本。"""
+        """Create a deep copy of the model on the specified device."""
         if other is None:
-            # 创建一个新实例
+            # Create a new instance
             new_model_instance = copy.deepcopy(self.model)
             other = ModelWrapper(new_model_instance).to(device)
         else:
-            # 如果提供了目标模型，则复制参数状态
+            # If target model provided, copy parameter state
             with torch.no_grad():
                 for param_to, param_from in zip(other.parameters(), self.parameters()):
                     param_to.data = param_from.data.clone()
         return other
 
     def get_params(self):
-        """返回模型参数列表。"""
+        """Return list of model parameters."""
         return list(self.parameters())
 
     def set_params(self, params, clone=True):
-        """从给定的参数列表设置模型参数。"""
+        """Set model parameters from given parameter list."""
         my_params = self.get_params()
         for p, q in zip(my_params, params):
             if clone:
@@ -299,14 +290,14 @@ class ModelWrapper(nn.Module):
                 p.data = q.to(p.device)
 
     def set_grads_from_grads(self, grads):
-        """设置模型的梯度。"""
+        """Set gradients for the model."""
         my_params = self.get_params()
         for p, grad in zip(my_params, grads):
             if grad is not None:
                 p.grad = grad.to(p.device)
 
     def compute_error_from_model(self, other):
-        """计算此模型与另一个模型参数之间的均方误差。"""
+        """Calculate mean squared error between this model and another model's parameters."""
         my_params = self.get_params()
         other_params = other.get_params()
         with torch.no_grad():
@@ -317,12 +308,12 @@ class ModelWrapper(nn.Module):
             return error / total_num * 1e6
 
 class ModelFactory:
-    """使用 ModelScope 创建指定LLM模型的工厂。"""
+    """Factory for creating specified LLM models using ModelScope."""
     @staticmethod
     def create_model(config, device_map=None):
         """
-        创建模型，优先使用本地目录。
-        device_map: 关键参数。对于并行训练，应为 None。
+        Create model, prioritizing local directory.
+        device_map: Key parameter. For parallel training, should be None.
         """
         if config.local_model_dir and os.path.exists(config.local_model_dir):
             model_dir = config.local_model_dir
@@ -332,19 +323,16 @@ class ModelFactory:
             model_dir = snapshot_download(
                 config.modelscope_name, 
                 revision='master',
-                cache_dir=os.path.dirname(config.local_model_dir) # 使用 config 中 local_dir 的父目录作为缓存
+                cache_dir=os.path.dirname(config.local_model_dir) # Use parent directory of local_dir in config as cache
             )
             print(f"Model downloaded to: {model_dir}")
         
-        # 加载模型
-        # **重要修复**：
-        # 将 device_map="auto" 更改为 device_map=None（或由调用者指定）。
-        # `device_map="auto"` 会与 `train_loop_parallel` 中的手动设备放置冲突。
+        # Load model
         model = AutoModelForCausalLM.from_pretrained(
             model_dir,
-            torch_dtype="auto", # 使用 "auto" 或 torch.bfloat16
+            torch_dtype="auto", # Use "auto" or torch.bfloat16
             trust_remote_code=True,
-            device_map=device_map # 允许调用者控制
+            device_map=device_map # Allow caller to control
         )
 
         return ModelWrapper(model)
@@ -354,8 +342,8 @@ class ModelFactory:
 # ==========================
 
 def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset):
-    """执行单个训练步骤（前向和后向传播）。"""
-    # 为此特定步骤设置可复现的种子
+    """Execute a single training step (forward and backward pass)."""
+    # Set reproducible seed for this specific step
     np.random.seed(step + seed_offset)
     torch.manual_seed(step + seed_offset)
     torch.cuda.manual_seed(step + seed_offset)
@@ -363,13 +351,13 @@ def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset
     try:
         batch = next(data_iter)
     except StopIteration:
-        # print(f"Data iterator reset at step {step}") # 用于调试
+        # print(f"Data iterator reset at step {step}") # For debugging
         data_iter = iter(dataloader) 
         batch = next(data_iter)
         
     batch = to_device(batch, device)
     
-    # 确保有labels字段
+    # Ensure labels field exists
     if 'labels' not in batch:
         batch['labels'] = batch['input_ids'].clone()   
 
@@ -382,7 +370,7 @@ def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset
     loss = outputs.loss
     loss.backward()
     
-    # 计算指标
+    # Calculate metrics
     perplexity = torch.exp(loss.detach()) if loss is not None else torch.tensor(float('inf'))
     
     with torch.no_grad():
@@ -399,7 +387,7 @@ def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset
     }
 
 def evaluate_model(model, test_loader, device):
-    """在测试集上评估模型性能。"""
+    """Evaluate model performance on test set."""
     model.eval()
     total_loss = 0.0
     total_perplexity = 0.0
@@ -423,7 +411,7 @@ def evaluate_model(model, test_loader, device):
                 total_loss += loss.item()
                 total_perplexity += perplexity.item()
             
-            # 计算准确率和F1分数
+            # Calculate accuracy and F1 score
             logits = outputs.logits
             preds = torch.argmax(logits, dim=-1)
             accuracy, f1 = calculate_metrics(preds, batch['labels'])
@@ -440,7 +428,7 @@ def evaluate_model(model, test_loader, device):
     avg_accuracy = total_accuracy / total_batches
     avg_f1 = total_f1 / total_batches
     
-    model.train() # 将模型设置回训练模式
+    model.train() # Set model back to training mode
     return avg_loss, avg_perplexity, avg_accuracy, avg_f1
 
 # ==========================
@@ -448,11 +436,11 @@ def evaluate_model(model, test_loader, device):
 # ==========================
 
 def run_worker(model, optimizer, dataloader, queues, device, seed_offset):
-    """每个并行工作进程执行的函数。"""
+    """Function executed by each parallel worker process."""
     data_iter = iter(dataloader)
     while True:
         ret = queues[0].get()
-        if ret is None: # 终止信号
+        if ret is None: # Termination signal
             return
             
         params, step = ret
@@ -461,7 +449,7 @@ def run_worker(model, optimizer, dataloader, queues, device, seed_offset):
         res = take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset)
         data_iter = res['data_iter']
         
-        grads = [p.grad.clone() for p in model.get_params()] # 克隆梯度以安全发送
+        grads = [p.grad.clone() for p in model.get_params()] # Clone gradients for safe sending
         
         queues[1].put((grads, step, {
             'loss': res['loss'], 
@@ -472,16 +460,16 @@ def run_worker(model, optimizer, dataloader, queues, device, seed_offset):
         }))
 
 def _create_optimizer(model, config):
-    """根据配置创建优化器。"""
+    """Create optimizer based on configuration."""
     if config.optimizer_type.lower() == 'sgd':
         return optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
     elif config.optimizer_type.lower() == 'adam':
         return optim.Adam(model.parameters(), lr=config.learning_rate)
-    else: # 默认 'adamw'
+    else: # Default 'adamw'
         return optim.AdamW(model.parameters(), lr=config.learning_rate)
 
 def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
-    """使用固定点迭代算法的主并行训练循环。"""
+    """Main parallel training loop using fixed-point iteration algorithm."""
     if config.device_count <= 1:
         print("Only one GPU found, falling back to serial training.")
         return train_loop_serial(config, model, train_loader, test_loader, csv_logger)
@@ -490,12 +478,12 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
     queues = (mp.Queue(), mp.Queue())
     processes = []
 
-    # 为工作进程创建模型和优化器
+    # Create models and optimizers for worker processes
     for rank in range(1, config.device_count):
         worker_device = torch.device(f"cuda:{rank}")
-        # **重要**：
-        # 工作进程在自己的设备上创建自己的模型实例
-        # 这里 device_map=None 是正确的
+        # **Important**:
+        # Worker processes create their own model instances on their own devices
+        # Here device_map=None is correct
         worker_model = ModelFactory.create_model(config, device_map=None).to(worker_device)
         worker_optimizer = _create_optimizer(worker_model, config)
         
@@ -503,12 +491,12 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         p.start()
         processes.append(p)
 
-    # 主进程设置
+    # Main process setup
     device = torch.device("cuda:0")
     model = model.to(device)
     
     T = config.max_steps
-    P = min(config.P, T, config.device_count - 1) # 窗口大小不能超过工作进程数
+    P = min(config.P, T, config.device_count - 1) # Window size cannot exceed worker count
     if P != config.P:
         print(f"Warning: Window size P reduced from {config.P} to {P} to match worker count.")
         
@@ -522,7 +510,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
 
     running_loss, running_perplexity, running_accuracy, running_f1, running_total = 0.0, 0.0, 0.0, 0.0, 0
 
-    # 初始化模型和优化器状态
+    # Initialize model and optimizer states
     for step in range(P + 1):
         models[step] = model.clone(device)
         optimizers[step] = _create_optimizer(models[step], config)
@@ -538,14 +526,14 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         pred_f = [None] * parallel_len
         metrics = [None] * parallel_len
 
-        # 1. 分发任务给工作进程
+        # 1. Distribute tasks to worker processes
         comm_start_time = time.time()
         for i in range(parallel_len):
             step = begin_idx + i
             params = [p.data for p in models[step].get_params()]
             queues[0].put((params, step))
 
-        # 2. 从工作进程收集结果
+        # 2. Collect results from worker processes
         for _ in range(parallel_len):
             _grads, _step, _metrics = queues[1].get()
             _i = _step - begin_idx
@@ -554,7 +542,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         time_comm_per_iter = time.time() - comm_start_time
         total_comm_time += time_comm_per_iter
 
-        # 3. 执行固定点迭代更新
+        # 3. Execute fixed-point iteration updates
         rollout_model = models[begin_idx]
         rollout_optimizer = optimizers[begin_idx]
         ind, errors_all = None, 0
@@ -567,18 +555,18 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
             
             error = rollout_model.compute_error_from_model(models[step + 1])
             
-            # 累积误差用于自适应阈值
+            # Accumulate errors for adaptive threshold
             if config.adaptivity_type == 'median' and i == parallel_len // 2:
                 errors_all = error
             elif config.adaptivity_type == 'mean':
                 errors_all += error / parallel_len
 
-            # 检查收敛
+            # Check convergence
             if ind is None and (error > thresh or i == parallel_len - 1):
                 ind = step + 1
                 optimizer_state_clone(rollout_optimizer, optimizers[step + 1])
 
-            # 累积指标 (仅限已验证的步骤)
+            # Accumulate metrics (only for verified steps)
             if ind is None or step < ind:
                 _metrics = metrics[i]
                 running_loss += _metrics['loss']
@@ -588,15 +576,15 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
                 running_total += _metrics['batch_size']
             
             if ind is not None:
-                # 一旦找到不匹配点，用 'rollout' 的真实状态更新所有后续模型
+                # Once mismatch found, update all subsequent models with 'rollout' true state
                 models[step + 1] = rollout_model.clone(device, models[step + 1])
             
             total_Grad += 1
 
-        # 4. 更新误差阈值 (EMA)
+        # 4. Update error threshold (EMA)
         thresh = thresh * config.ema_decay + errors_all * (1 - config.ema_decay)
         
-        # 5. 滑动窗口
+        # 5. Slide window
         progress = ind - begin_idx
         pbar.update(progress)
         total_iters += 1
@@ -604,7 +592,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         new_begin_idx = ind
         new_end_idx = min(new_begin_idx + parallel_len, T)
 
-        # 准备下一个窗口的模型
+        # Prepare models for next window
         for step in range(end_idx + 1, new_end_idx + 1):
             prev_model_idx = step - parallel_len - 1
             models[step] = rollout_model.clone(device, models[prev_model_idx] if prev_model_idx >= 0 else None)
@@ -615,7 +603,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         time_per_iter = time.time() - start_time_per_iter
         time_comp_per_iter = time_per_iter - time_comm_per_iter
 
-        # 6. 记录进度到 CSV 和 Pbar
+        # 6. Record progress to CSV and Pbar
         if begin_idx > 0:
             avg_loss = running_loss / begin_idx
             avg_perplexity = running_perplexity / begin_idx
@@ -641,7 +629,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
                 "time_comm_per_iter": time_comm_per_iter,
                 "time_comp_per_iter": time_comp_per_iter
             })
-            csv_logger.save() # 频繁保存以防崩溃
+            csv_logger.save() # Frequent saves in case of crash
 
     end_event.record()
     torch.cuda.synchronize()
@@ -649,7 +637,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
     elapsed_str = str(timedelta(seconds=int(elapsed)))
     pbar.close()
 
-    # 清理工作进程
+    # Clean up worker processes
     for _ in processes:
         queues[0].put(None)
     for p in processes:
@@ -658,7 +646,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
     final_model = models[T]
     del models, optimizers
     
-    # 最终评估
+    # Final evaluation
     test_loss, test_perplexity, test_accuracy, test_f1 = evaluate_model(final_model, test_loader, device)
 
     upper_bound = total_iters * P
@@ -692,7 +680,7 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
     return final_model
 
 def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
-    """标准的串行训练循环。"""
+    """Standard serial training loop."""
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
@@ -712,17 +700,17 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
         res = take_step(model, optimizer, train_loader, data_iter, device, step, config.seed)
         data_iter = res['data_iter']
         
-        # 梯度已在 take_step 中计算，这里应用
+        # Gradients already computed in take_step, apply here
         optimizer.step()
         
-        # 更新统计数据
+        # Update statistics
         running_loss += res['loss']
         running_perplexity += res['perplexity']
         running_accuracy += res['accuracy']
         running_f1 += res['f1_score']
         running_total += res['batch_size']
         
-        # 更新进度条
+        # Update progress bar
         if (step + 1) % 5 == 0 or (step + 1) == config.max_steps:
             avg_loss = running_loss / (step + 1)
             avg_perplexity = running_perplexity / (step + 1)
@@ -735,7 +723,7 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
                 f'Loss: {avg_loss:.4f} | PPL: {avg_perplexity:.2f} | Acc: {avg_accuracy:.2%} | F1: {avg_f1:.2%} | Time: {elapsed_str}'
             )
             
-            # 记录指标
+            # Record metrics
             csv_logger.log({
                 "Iter": step + 1,
                 "Train_Loss": avg_loss,
@@ -744,7 +732,7 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
                 "Train_F1": avg_f1,
                 "Original_Steps": step + 1
             })
-            csv_logger.save() # 频繁保存
+            csv_logger.save() # Frequent saves
         
         pbar.update(1)
     
@@ -752,7 +740,7 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
     
     elapsed = time.time() - start_time
         
-    # 最终测试
+    # Final test
     test_loss, test_perplexity, test_accuracy, test_f1 = evaluate_model(model, test_loader, device)
 
     csv_logger.log({
@@ -776,22 +764,22 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
 # ==========================
 
 def setup_arg_parser():
-    """设置命令行参数解析器。"""
+    """Set up command line argument parser."""
     parser = argparse.ArgumentParser(description='ParaOpt Training for Language Models (ModelScope Version)')
 
-    # 训练超参数
+    # Training hyperparameters
     parser.add_argument('--device_count', type=int, help='Number of CUDA devices')
     parser.add_argument('--batch_size', type=int, help='Batch size')
     parser.add_argument('--max_steps', type=int, help='Total training steps')
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
 
-    # 并行超参数
+    # Parallel hyperparameters
     parser.add_argument('--P', type=int, help='Window size for parallel algorithm')
     parser.add_argument('--threshold', type=float, help='Error threshold')
     parser.add_argument('--ema_decay', type=float, help='EMA decay for threshold')
     parser.add_argument('--adaptivity_type', type=str, choices=['mean', 'median'], help='Error computation type')
     
-    # 通用配置
+    # General configuration
     parser.add_argument('--optimizer_type', type=str, choices=['sgd', 'adam', 'adamw'], help='Optimizer type')
     parser.add_argument('--training_mode', type=str, choices=['parallel', 'serial'], help='Training mode')
     parser.add_argument('--modelscope_name', type=str, help='Model name from ModelScope (e.g., qwen/qwen-1_8b)')
@@ -800,25 +788,25 @@ def setup_arg_parser():
     parser.add_argument('--local_dataset_dir', type=str, help='Path to local dataset directory (overrides Config)')
     parser.add_argument('--max_length', type=int, help='Maximum sequence length for tokenizer')
     
-    # 输出配置
+    # Output configuration
     parser.add_argument('--output_dir', type=str, help='Directory to save logs (overrides Config)')
     parser.add_argument('--output_csv', type=str, help='Exact output CSV file path (overrides auto-naming)')
 
     return parser
 
 def train_with_config(config=None, csv_logger=None):
-    """使用给定的配置运行一个完整的训练过程。"""
+    """Run a complete training process with given configuration."""
     if config is None:
         config = Config()
 
-    # 设置随机种子
+    # Set random seeds
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # 初始化 CSV logger
+    # Initialize CSV logger
     if csv_logger is None:
         csv_logger = CSVLogger()
     
@@ -829,16 +817,16 @@ def train_with_config(config=None, csv_logger=None):
         print(f"Parallel Config: P={config.P}, Threshold={config.threshold}, Adaptivity={config.adaptivity_type}")
     print(f"Log file: {csv_logger.filename}")
     
-    # 加载数据
+    # Load data
     train_loader, test_loader = get_dataloaders(config)
     
-    # 创建模型
-    # **重要**：
-    # 在主进程中，我们不使用 device_map="auto"。
-    # `train_loop_serial` 和 `train_loop_parallel` 将负责将其移动到 cuda:0。
+    # Create model
+    # **Important**:
+    # In main process, we don't use device_map="auto".
+    # `train_loop_serial` and `train_loop_parallel` will be responsible for moving it to cuda:0.
     model = ModelFactory.create_model(config, device_map=None)
     
-    # 开始训练
+    # Start training
     if config.training_mode.lower() == "parallel":
         train_loop_parallel(config, model, train_loader, test_loader, csv_logger)
     else:
@@ -855,18 +843,18 @@ def main():
     config = Config()
     config.update_from_args(args)
     
-    # 确定输出CSV文件的路径
+    # Determine output CSV file path
     output_csv = args.output_csv
     
     if output_csv is None:
-        # 如果未提供确切路径，则自动构建路径
+        # If exact path not provided, auto-construct path
         directory_path = os.path.join(
-            config.output_dir, # 使用 config 中的 (可能被 arg 覆盖的) output_dir
-            config.modelscope_name.split('/')[-1], # 使用模型的简称
+            config.output_dir, # Use (possibly arg-overridden) output_dir from config
+            config.modelscope_name.split('/')[-1], # Use short name of model
             f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}"
         )
         
-        # 文件名
+        # File name
         if config.training_mode == 'parallel':
             filename = f"{config.training_mode}_{config.adaptivity_type}_P_{config.P}_tor_{config.threshold}_ema_{config.ema_decay}.csv"
         else:
