@@ -1,16 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-This script merges the parallel training logic from cv.py with the 
-training features (AMP, LR scheduling, validation) from train_cifar10.py.
 
-Key features:
-- Supports both parallel (ParaOpt-style) and serial training modes.
-- Converts epoch-based training (--n_epochs) to max_steps.
-- Integrates CosineAnnealingLR scheduling in both modes.
-- Integrates mixed-precision training (autocast).
-- Adds periodic validation and best-model checkpointing.
-"""
 
 import torch
 import torch.nn as nn

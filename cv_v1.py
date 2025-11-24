@@ -19,9 +19,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 import csv
 from datetime import datetime
 
-# Note: The original code references 'MsDataset', 'DownloadMode', and 'Image' 
-# without importing them. Per the request to only remove unused code and 
-# not add/fix logic, these unresolved references remain.
+
 
 # ========== Config Class ==========
 class Config:

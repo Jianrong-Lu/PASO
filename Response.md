@@ -29,7 +29,7 @@ Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112;
 
 |Method|PPL$\downarrow$|Total tokens$\downarrow$|Iters$\downarrow$|time (s)$\downarrow$|
 |-|-|-|-|-|
-|Adam|20.4|734817|1k|694|
+|Adam|20.4|7348175|1k|694|
 |Adam+Naive DP|20.5|7348942|1k|440 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**133** (5.2$\times$)|
 |Adam+Naive PASO|20.5|**7322406**|**0.16k**|136 (5.1$\times$)|
@@ -168,7 +168,7 @@ To make a fair comparison, we compare our naive PASO with naive DP  and its full
 Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112; learning rate 6e-5
 |Method|PPL$\downarrow$|Total tokens$\downarrow$|Iters$\downarrow$|time (s)$\downarrow$|
 |-|-|-|-|-|
-|Adam|20.4|734817|1k|694|
+|Adam|20.4|7348175|1k|694|
 |Adam+Naive DP|20.5|7348942|1k|440 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**133** (5.2$\times$)|
 |Adam+Naive PASO|20.5|**7322406**|**0.16k**|136 (5.1$\times$)|
@@ -224,7 +224,7 @@ We define token count as tokens processed by model per iteration, reporting the 
 Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112; learning rate 6e-5
 |Method|PPL$\downarrow$|Total tokens$\downarrow$|Iters$\downarrow$|time (s)$\downarrow$|
 |-|-|-|-|-|
-|Adam|20.4|734817|1k|694|
+|Adam|20.4|7348175|1k|694|
 |Adam+Naive DP|20.5|7348942|1k|440 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**133** (5.2$\times$)|
 |Adam+Naive PASO|20.5|**7322406**|**0.16k**|136 (5.1$\times$)|
