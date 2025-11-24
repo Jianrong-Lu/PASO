@@ -1,21 +1,21 @@
-# General Response to all Reviewers, ACs, and PCs
+# General Response to all Reviewers.
 
 We sincerely thank the reviewers for their time and effort in carefully reviewing this manuscript. We are encouraged by the exceptionally positive assessment on the **strong conceptual novelty** (Reviewers bekR, ypoz, VTKr), **solid theoretical foundations** (Reviewers bekR, ypoz), and **promising speedup results** (Reviewers bekR, kux2).
 
-The reviewers have raised common concerns regarding reproducibility, comparisons relative to existing parallel methods (such as OptEx and strong parallel methods), memory costs, the low accuracy and perplexity, and the validity of specific experimental metrics. In response, **we have some exciting theoretical and experimental results** addressing these concerns:
+The reviewers have raised several concerns regarding reproducibility, comparisons relative to existing parallel methods (such as OptEx and strong parallel methods), costs, and the low accuracy and perplexity. In response, **we have some exciting theoretical and experimental results** that has directly and thoughtly addressed these concerns:
 
-* **Reproducibility**: We have open-sourced our code with a detailed running script, **full environment specifications (including CUDA/NCCL versions, hardware topology), library dependencies, and random seed configurations (Reviewers VTKr, kux2)**. Our code: https://anonymous.4open.science/r/PASO-8ECE/.
-* **Computation, Communication, and Space Complexity:** We have added both theoretical complexity analyses and empirical comparisons against the approximate method, OptEx. **Excitingly**, our analysis reveals that PASO achieves a linear speedup rate, whereas OptEx is limited to a sub-linear. Furthermore, PASO maintains significantly lower space complexity ($\mathcal{O}(Nd)$)  and compared to OptEx ($\mathcal{O}((T_0+N)d)$).  In our memory-efficient implementation `cv_nccl.py`, PASO maintains only one optimizer and model per device, matching the memory footprint of data parallelism. These makes PASO fundamentally scalable for large models. 
-* **Competitive Performance against Fully Optimized Parallel Baselines:** We compared our naive PASO implementation against both naive Data Parallelism (DP) implementation and fully optimized industrial DP (PyTorch `DDP`). **Remarkably**, our naive PASO implementation is $2+$ times faster then the naive DP, and matches the performance of fully optimized industrial DP (achieving a $\approx 5.1\times$ speedup), while consuming the minimum number of tokens. This highlights the immense potential of PASO, particularly because its inter-step parallelism is orthogonal to—and can be combined with—intra-step DP.
+* **Reproducibility**: We have anonymously open-sourced our code with a detailed running script, **full environment specifications (including CUDA/NCCL versions, hardware topology), library dependencies, and random seed configurations (Reviewers VTKr, kux2)**. Our code: https://anonymous.4open.science/r/PASO-8ECE/.
+* **Computation, Communication, and Space Complexity:** We have added both theoretical complexity analyses and empirical comparisons against the approximate method, OptEx in Appendix A. **Excitingly**, our analysis reveals that PASO achieves a linear speedup rate, whereas OptEx is limited to a sub-linear. Furthermore, PASO maintains significantly lower space complexity ($\mathcal{O}(Nd)$)  and compared to OptEx ($\mathcal{O}((T_0+N)d)$).  In our memory-efficient implementation `cv_nccl.py`, PASO maintains only one optimizer and model per device, matching the memory footprint of data parallelism. These makes PASO fundamentally scalable for large models. 
+* **Competitive Performance against Fully Optimized Parallel Baselines:** We compared our naive PASO implementation against both naive Data Parallelism (DP) implementation and fully optimized industrial DP (PyTorch `DDP`). **Remarkably**, our naive PASO implementation is $2.3$ times faster then the naive DP, and matches the performance of fully optimized industrial DP framework, Pytorch's `DistributedDataParallel`, achieving a $\approx 5.1\times$ speedup while consuming the minimum number of tokens. This highlights the immense potential of PASO, particularly because its inter-step parallelism is orthogonal to—and can be combined with—intra-step DP.
 * **Validation under Standard Implementation:** We have addressed the implementation issues regarding low accuracy and and perplexity calculations. Our updated results, now reported with multiple random seeds and standard deviations, **match community benchmarks**. This confirms that PASO accelerates training without compromising model quality.
 
-**We sincerely invite you to refer to the detailed responses below and the provided source code. We are genuinely excited about these findings,** as they validate **PASO as a fundamental advancement in parallel training**—introducing **the first step-parallel training method without the loss of quality** based on equation system solving. We agree with the reviewers on the importance of scaling this approach further and are eager to pursue future explorations, such as combining PASO with industrial-grade distributed frameworks. 
+**We believe we have directly and thoroughly addressed  the key  concerns. We sincerely invite you to refer to the detailed responses below and the provided source code. We are genuinely excited about these findings,** as they validate **PASO as a fundamental advancement in parallel training**—introducing **the first step-parallel training method without the loss of quality** based on equation system solving. We agree with the reviewers on the importance of scaling this approach further and are eager to pursue future explorations, such as combining PASO with industrial-grade distributed frameworks. 
 
 **Looking ahead**, our vision is to evolve PASO into a robust, industrial-caliber  step-parallel training ecosystem. By synergizing our step-parallel approach with existing  parallelism and memory optimization techniques like ZeRO, we aim to unlock unprecedented efficiency in the training of LLMs.
 
 **Last but not least**, we thank the PCs, ACs, and reviewers again for their invaluable time and effort. We commit that the final accepted manuscript will include  the newly added experiments and analyses. Furthermore, **we will ensure the reviews and author discussion remain public as well.**
 
-### **Response to Reviewer bekR** （负分4）
+### **Response to Reviewer bekR** （4）
 
 We thank Reviewer bekR for the positive feedback.
 
@@ -32,7 +32,7 @@ Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112;
 |Adam|20.4|7344101|1k|614|
 |Adam+Naive DP|20.5|7348942|1k|340 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**118** (5.2$\times$)|
-|Adam+Naive PASO|20.5|**7312230**|**0.16k**|146 (5.1$\times$)|
+|Adam+Naive PASO|20.5|**7322406**|**0.16k**|146 (5.1$\times$)|
 
 > No memory overhead analysis is discussed in the study.
 
@@ -80,7 +80,7 @@ Our current implementation (see `llm_v2.py`) is memory-cost in which we adopt a 
 
 For a model too large for one GPU, one would *first* apply **intra-step** parallelism to shard the model *within* a single step. PASO would then operate *on top* of this, managing the **inter-step** parallelism. 
 
-### **Response to Reviewer ypoz** （6分正分）
+### **Response to Reviewer ypoz** （6）
 
 Thank for the very positive and encouraging review. 
 
@@ -90,7 +90,7 @@ We agree that scaling beyond 8 GPUs  represent critical next steps. Given curren
 
 >  Might not generalize to industrial-scale systems.
 
-We clarify that this limitation stems from the engineering constraints of our research prototype, not any fundamental constraint of PASO. Our `cv_nccl.py` resolves this bottleneck  by requiring each GPU to maintain only a single model and optimizer. 
+We clarify that this limitation stems from the engineering constraints of our research prototype, not any fundamental constraint of PASO. Our `cv_nccl.py` resolves this bottleneck  in which each GPU   maintains only a single model and optimizer. 
 
 >  Clearer pseudocode; Notation Complexity.
 
@@ -136,13 +136,13 @@ PASO is fully compatible with them. PASO's guarantees are about finding the uniq
 
 
 
-### **Response to Reviewer kux2** (2分)
+### **Response to Reviewer kux2** (2)
 
 We thank Reviewer kux2 for the feedback. We believe there are key misunderstandings about our method's memory and theoretical claims.
 
 > Prop.2 only shows one can reproduce GD in $K \le T$ outer iterations, and there is no theorem that $K \ll T$ .
 
-We clarify that Prop. 2 guarantees only that PASO converges to the exact sequential trajectory at a speed no slower than sequential methods. Our core claim regarding speedup is an empirical finding (Lines 200–201). Given the inherent complexity of black-box neural network optimization, providing a principled proof for this speedup remains challenging, and we thus defer it to future work.
+We clarify that Prop. 2 guarantees only that PASO converges to the exact sequential trajectory at a speed no slower than sequential methods. Our core claim regarding speedup is an empirical finding (Lines 200–201). Since the inherent complexity of black-box neural network optimization, providing a principled proof for this speedup remains challenging in the community. 
 
 > The method ... requires $p$ simultaneous graphs ... The paper nevertheless claims "1 model + 1 optimizer" storage per device in Tab. 1, which appears optimistic. Will that implicitly change the sampling process and may require staging many batches concurrently? How are the future mini-batches produced and pinned to devices? Is the distribution i.i.d. with replacement? Does pre-sampling introduce measurable drift?
 
@@ -171,12 +171,12 @@ Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112;
 |Adam|20.4|7344101|1k|614|
 |Adam+Naive DP|20.5|7348942|1k|340 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**118** (5.2$\times$)|
-|Adam+Naive PASO|20.5|**7312230**|**0.16k**|146 (5.1$\times$)|
+|Adam+Naive PASO|20.5|**7322406**|**0.16k**|146 (5.1$\times$)|
 
 
 > The reported accuracy and perplexity results are presented without multiple seeds or error bars. 
 
-We'll run all experiments with 5 different random seeds and update all tables to report the mean and standard deviation for accuracy and perplexity.
+In the revised version, we run all experiments with 5 different random seeds and update Tale 2&3 to report the mean and standard deviation.
 
 > The EMA-based tolerance update rule $\delta$ has no accuracy guarantee, it is tuned by Wandb sweeps rather than relying on derived principle.
 
@@ -184,7 +184,7 @@ We clarify that using EMA for adaptive estimation is a well-established paradigm
 
 
 
-### **Response to Reviewer VTKr** （2分）
+### **Response to Reviewer VTKr** （2）
 
 Thank you for the nice suggestions.  **We have opened our code (see the general response)**. 
 
@@ -219,7 +219,7 @@ Our public code provides full details like execution scripts, etc. (see `README.
 
 > Include plots using num_tokens to allow fair comparison with DDP and other baselines under the same computational budget. Also clarify how num_tokens was defined and whether it was kept consistent across all experiments.
 
-We define token count as tokens processed by model per iteration, reporting the cumulative total consumed tokens during training. Our naive PASO implementation is compared against both naive and fully-optimized Data Parallelism (DP). **The results are really exciting**. Our naive PASO  consumes the minimum number of tokens but achieves a 2.3× speedup over the naive DP, matching industrial DP performance. 
+We define token count as tokens processed by model per iteration, reporting the cumulative  consumed tokens during training. Our naive PASO implementation is compared against both naive and fully-optimized Data Parallelism (DP). **The results are really exciting**. Our naive PASO  consumes the minimum number of tokens but achieves a 2.3× speedup over the naive DP, matching industrial DP performance. 
 
 Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112; learning rate 6e-5
 |Method|PPL $\downarrow$|Total tokens $\downarrow$|Iters $\downarrow$|time (s)$\downarrow$|
@@ -227,9 +227,9 @@ Table 2: Comparisons on GPT-2 over WiKiText-2 (see `llm_v2.py`). Batch size 112;
 |Adam|20.4|7344101|1k|614|
 |Adam+Naive DP|20.5|7348942|1k|340 (1.8$\times$)|
 |Adam+Full optimized industrial DP (Pytorch's `DDP`)|20.4| 7348942|1k|**118** (5.2$\times$)|
-|Adam+Naive PASO|20.5|**7312230**|**0.16k**|146 (5.1$\times$)|
+|Adam+Naive PASO|20.5|**7322406**|**0.16k**|146 (5.1$\times$)|
 
-We'll plot the loss and perplexity curves w.r.t consumed tokens. 
+We have added loss curves w.r.t consumed tokens in Fig. 3 in the revised version. 
 
 > Ambiguity in metric definitions. Is token-level accuracy?
 
@@ -242,16 +242,16 @@ The low accuracy on CV tasks is likely because our models were trained with a fi
 Table 2: Top 1 Accuracy (ACC) comparison for CNN on CIFAR10 (`cv_v2.py`).  
 |Method|ACC $\uparrow$|Iters $\downarrow$|Speedup $\uparrow$|
 |-|-|-|-|
-|Adam|82.04 $\pm$ 0.22|60k|1 $\times$|
-|PASO|81.59 $\pm$ 0.13|9.8k| 6.1 $\times$        |
+|Adam|81.5 $\pm$ 0.22|60k|1 $\times$|
+|PASO|81.3 $\pm$ 0.13|9.8k| 6.1 $\times$|
 
 The low PPL results from the incorrect use of repetitive padding tokens for PPL computation (see `llm_v1.py`).  After fixing this bug (see `llm_v2.py`), our PPL shows a comparable value  v.s. community benchmarks.
 
 Table 2: Comparisons for Llama-3.2-1B on WikiText-2 (`llm_v2.py`)
 |Method|PPL $\uparrow$|Iters $\downarrow$|Speedup $\uparrow$|
 |-|-|-|-|
-|Adam|13.28 $\pm$ 0.36$|1000| 1 $\times$|
-|PASO|13.29 $\pm$ 0.40$ |81| 12.3 $\times$|
+|Adam|12.5 $\pm$ 0.36$|1000| 1 $\times$|
+|PASO|12.3 $\pm$ 0.40$ |81| 12.3 $\times$|
 
 > Direct W&B Fig.; difficult to assess differences across methods. Tab. 4–5 omit information. 
 

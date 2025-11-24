@@ -79,13 +79,13 @@ python cv_v1.py --dataset cifar10 --model_name cnn --max_steps 60000 --batch_siz
 **Sequential Training:**
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 7
+python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 35
 ```
 
 **PASO Training:**
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.9 --training_mode serial --P 7
+python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.9 --training_mode serial --P 35
 ```
 **Naive Data-Parallel Training:**
 
@@ -106,13 +106,13 @@ python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelsc
 **Sequential Training:**
 
 ```bash
-python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode serial --P 7
+python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode serial --P 35
 ```
 
 **PASO Training:**
 
 ```bash
-python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 7
+python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 35
 ```
 
 -----
