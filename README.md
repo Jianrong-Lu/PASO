@@ -1,5 +1,5 @@
 # PASO: Step-Parallel Training
-# Test
+
 **PASO** is the first step-parallel training method based on equation system solving. By reformulating the optimization process as a fixed-point problem, PASO breaks the sequential dependency of standard optimizers, allowing for **significant acceleration in training** without sacrificing model accuracy.
 
 -----
