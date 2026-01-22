@@ -4,7 +4,7 @@ import torch.optim as optim
 from datasets import load_dataset, disable_caching
 from modelscope import snapshot_download
 from modelscope import AutoTokenizer, AutoModelForCausalLM
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
+# from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,9 +17,9 @@ import numpy as np
 import copy
 import os
 import json
-from sklearn.metrics import accuracy_score, f1_score
 import csv
 from datetime import datetime
+from transformers import get_scheduler
 
 # Try importing DeepSpeed
 try:
@@ -46,7 +46,7 @@ def count_real_tokens(batch, pad_token_id):
     return real_tokens
 
 # ==========================
-# CSV Logger Class (Unchanged)
+# CSV Logger Class
 # ==========================
 class CSVLogger:
     def __init__(self, filename=None):
@@ -89,28 +89,37 @@ class Config:
     momentum = 0.9
 
     # Acceleration configuration
-    P = 8
+    P = 4
     threshold = 1e-5
     ema_decay = 0.999
-    adaptivity_type = 'median'
+    adaptivity_type = 'mean'
+    stage = 1
     
     # System configuration
     seed = 42
     device_count = torch.cuda.device_count()
     
     # Model and dataset configuration
-    modelscope_name = 'gpt2'
-    local_model_dir = "./model/gpt2"
-    dataset_name = 'local_wikitext'
-    local_dataset_dir = "./data/wikitext-2" 
-    
+    modelscope_name = 'Llama-3.2-1B' 
+    local_model_dir = "./model/Llama-3.2-1B"
+    dataset_name = 'local_wikitext'    
+    local_dataset_dir = "./dataset/wikitext/wikitext-2"
+
     max_length = 512
     optimizer_type = 'adam'
     training_mode = 'parallel' 
-    sweep_config_path = 'XXX.json'
+
     
-    # Added to store pad token id globally
+    # Global pad token id
     pad_token_id = None 
+
+    # Validation features
+    val_interval = 1001 
+    checkpoint_dir = './checkpoint'
+
+    # Scheduler
+    lr_scheduler_type = 'cosine'
+    warmup_steps = 100
 
     def update_from_args(self, args):
         for key, value in vars(args).items():
@@ -123,20 +132,8 @@ class Config:
 def to_device(batch, device):
     return {k: v.to(device) for k, v in batch.items()}
 
-def calculate_metrics(preds, labels, ignore_index=-100):
-    preds = preds.cpu().flatten()
-    labels = labels.cpu().flatten()
-    mask = labels != ignore_index
-    preds = preds[mask]
-    labels = labels[mask]
-    if len(labels) == 0:
-        return 0.0, 0.0
-    accuracy = accuracy_score(labels, preds)
-    f1 = f1_score(labels, preds, average='macro', zero_division=0)
-    return accuracy, f1
-
 # ==========================
-# Model Definition (Unchanged)
+# Model Definition
 # ==========================
 class ModelWrapper(nn.Module):
     def __init__(self, model):
@@ -183,6 +180,7 @@ class ModelWrapper(nn.Module):
             for p, q in zip(my_params, other_params):
                 error += torch.linalg.norm(p - q).pow(2).item()
                 total_num += np.prod(list(q.shape))
+            
             return error / total_num * 1e6
 
 class ModelFactory:
@@ -219,32 +217,34 @@ def load_wikitext_from_local(path):
     return dataset
 
 def get_dataloaders(config, rank=None, world_size=None):
+    # 1. Load Tokenizer
     if config.local_model_dir and os.path.exists(config.local_model_dir):
         model_dir = config.local_model_dir
     else:
-        model_dir = snapshot_download(config.modelscope_name, revision='master',cache_dir="./model")
+        model_dir = snapshot_download(config.modelscope_name, revision='master', cache_dir="./model")
     
     if rank == 0 or rank is None:
         print(f"Loading tokenizer from {model_dir}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # ==========================================
-    # FIX: Store pad_token_id in config for counting
-    # ==========================================
     config.pad_token_id = tokenizer.pad_token_id
 
+    # 2. Load Dataset
     if rank == 0 or rank is None:
         print(f"Loading dataset: {config.dataset_name}...")
+    
     disable_caching()
 
     if config.dataset_name == 'local_wikitext':
         dataset = load_wikitext_from_local(config.local_dataset_dir)
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset_name}")
+
+    # 3. Preprocessing
     def tokenize_function(examples, tokenizer, max_length):
-        # Use the same text for both input and labels
         tokenized_inputs = tokenizer(
             examples["text"], 
             truncation=True, 
@@ -252,28 +252,19 @@ def get_dataloaders(config, rank=None, world_size=None):
             max_length=max_length,
             return_tensors="pt"
         )
-        
-        # Add labels field
         tokenized_inputs["labels"] = tokenized_inputs["input_ids"].clone()
-
-        # Key operation: Set padding tokens to -100 using attention_mask
-        # In attention_mask: 1=valid token, 0=padding
-        # Note: With batched=True in dataset.map, data is Tensor/list of lists
-        # Using torch operations (since return_tensors="pt")
-        
         labels = tokenized_inputs["labels"]
         attention_mask = tokenized_inputs["attention_mask"]
-        
-        # Set padding positions (mask=0) to -100 in labels
-        labels[attention_mask == 0] = -100
-        
-        # Update labels
+        labels[attention_mask == 0] = -100 
         tokenized_inputs["labels"] = labels
         return tokenized_inputs
 
     def preprocess(examples):
         return tokenize_function(examples, tokenizer, config.max_length)
         
+    if rank == 0 or rank is None:
+        print("Tokenizing dataset...")
+
     column_names = dataset["train"].column_names
     tokenized_datasets = dataset.map(
         preprocess,
@@ -281,40 +272,53 @@ def get_dataloaders(config, rank=None, world_size=None):
         remove_columns=column_names,
     )
     tokenized_datasets.set_format("torch")
-
-
-    train_sampler = None
-    test_sampler = None
-    if rank is not None and world_size is not None:
-        train_sampler = DistributedSampler(tokenized_datasets["train"], num_replicas=world_size, rank=rank, shuffle=True)
-        test_sampler = DistributedSampler(tokenized_datasets['validation'], num_replicas=world_size, rank=rank, shuffle=False)
-
-        train_loader = torch.utils.data.DataLoader(
+    
+    # 4. Sampler Configuration
+    use_distributed_sampler = False
+    if config.training_mode.lower() in ['ddp', 'deepspeed', 'naive_dp']:
+        if rank is not None and world_size is not None:
+            use_distributed_sampler = True
+            
+    if use_distributed_sampler:
+        train_sampler = DistributedSampler(
             tokenized_datasets["train"],
-            batch_size=config.batch_size//world_size,
-            shuffle=(train_sampler is None), 
-            sampler=train_sampler,
-            num_workers=8,
-            pin_memory=True,
-            persistent_workers=True,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
         )
-    else: 
-        train_loader = torch.utils.data.DataLoader(
-            tokenized_datasets["train"],
-            batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
-            sampler=train_sampler,
-            num_workers=8,
-            pin_memory=True,
-            persistent_workers=True,
-        )
+        train_shuffle = False 
+    else:
+        train_sampler = None
+        train_shuffle = True
+
+    train_loader = torch.utils.data.DataLoader(
+        tokenized_datasets["train"],
+        batch_size=config.batch_size if not use_distributed_sampler else config.batch_size // world_size,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+
     val_split = 'validation' if 'validation' in tokenized_datasets else 'test'
+    
+    if use_distributed_sampler:
+        test_sampler = DistributedSampler(
+            tokenized_datasets[val_split],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+    else:
+        test_sampler = None
+
     test_loader = torch.utils.data.DataLoader(
         tokenized_datasets[val_split],
-        batch_size=config.batch_size,
+        batch_size=config.batch_size if not use_distributed_sampler else config.batch_size // world_size,
         shuffle=False,
         sampler=test_sampler,
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
     )
@@ -325,8 +329,6 @@ def evaluate_model(model, test_loader, device):
     model.eval()
     total_loss = 0.0
     total_perplexity = 0.0
-    total_accuracy = 0.0
-    total_f1 = 0.0
     total_batches = 0
     
     with torch.no_grad():
@@ -335,24 +337,16 @@ def evaluate_model(model, test_loader, device):
             outputs = model(**batch)
             loss = outputs.loss
             
-            logits = outputs.logits
-            preds = torch.argmax(logits, dim=-1)
-            accuracy, f1 = calculate_metrics(preds, batch['labels'])
-            
             total_loss += loss.item()
             total_perplexity += torch.exp(loss).item()
-            total_accuracy += accuracy
-            total_f1 += f1
             total_batches += 1
     
-    if total_batches == 0: return 0,0,0,0
+    if total_batches == 0: return 0,0
     
     avg_loss = total_loss / total_batches
     avg_perplexity = total_perplexity / total_batches 
-    avg_accuracy = total_accuracy / total_batches
-    avg_f1 = total_f1 / total_batches
     model.train()
-    return avg_loss, avg_perplexity, avg_accuracy, avg_f1
+    return avg_loss, avg_perplexity
 
 # =================================================================
 # PASO (Parallel) and Worker Logic 
@@ -360,7 +354,6 @@ def evaluate_model(model, test_loader, device):
 def optimizer_state_clone(optimizer_from, optimizer_to):
     optimizer_to.load_state_dict(optimizer_from.state_dict())
 
-# FIX: Added pad_token_id argument
 def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset, pad_token_id):
     np.random.seed(step + seed_offset)
     torch.manual_seed(step + seed_offset)
@@ -373,12 +366,10 @@ def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset
         batch = next(data_iter)
         
     batch = to_device(batch, device)
-    
-    # FIX: Use helper to count real tokens
     num_tokens_in_batch = count_real_tokens(batch, pad_token_id)
 
     if 'labels' not in batch:
-        batch['labels'] = batch['input_ids'].clone()    
+        batch['labels'] = batch['input_ids'].clone()      
 
     optimizer.zero_grad()
     outputs = model(**batch)
@@ -393,32 +384,35 @@ def take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset
     return {
         'loss': loss.item(),
         'perplexity': perplexity.item(),
-        'accuracy': 0.0,
-        'f1_score': 0.0,
         'data_iter': data_iter,
         'batch_size': batch['input_ids'].size(0),
-        'num_tokens': num_tokens_in_batch # Now real tokens
+        'num_tokens': num_tokens_in_batch
     }
 
-# FIX: Added pad_token_id argument
-def run_worker(model, optimizer, dataloader, queues, device, seed_offset, pad_token_id):
+def run_worker(model, optimizer, dataloader, queues, device, seed_offset, pad_token_id, rank):
     data_iter = iter(dataloader)
+    
+    # Reset peak memory stats at start
+    torch.cuda.reset_peak_memory_stats(device)
+    
     while True:
         ret = queues[0].get()
         if ret is None:
+            # Capture peak memory before exiting
+            peak_memory = torch.cuda.max_memory_allocated(device)
+            queues[0].put((rank, peak_memory))
             return
+            
         params, step = ret
         model.set_params(params, clone=False)
-        # Pass pad_token_id to take_step
         res = take_step(model, optimizer, dataloader, data_iter, device, step, seed_offset, pad_token_id)
         data_iter = res['data_iter']
         grads = [p.grad for p in model.get_params()]
         queues[1].put((grads, step, {'loss': res['loss'], 
                                     'perplexity': res['perplexity'],
-                                    'accuracy': res['accuracy'],
-                                    'f1_score': res['f1_score'],
                                     'batch_size': res['batch_size'],
-                                    'num_tokens': res['num_tokens']}))
+                                    'num_tokens': res['num_tokens']})
+                                    )
 
 def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
     if config.device_count <= 1:
@@ -426,38 +420,49 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         return train_loop_serial(config, model, train_loader, test_loader, csv_logger)
 
     mp.set_start_method('spawn', force=True)
+    # Added 3rd queue for memory stats
     queues = (mp.Queue(), mp.Queue())
     processes = []
 
     for rank in range(1, config.device_count):
         worker_device = torch.device(f"cuda:{rank}")
-        worker_model = ModelFactory.create_model(config).to(worker_device)
+        model = model.to(worker_device)
+
         if config.optimizer_type.lower() == 'sgd':
-            worker_optimizer = optim.SGD(worker_model.parameters(), lr=config.learning_rate, momentum=config.momentum)
+            worker_optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
         elif config.optimizer_type.lower() == 'adam':
-            worker_optimizer = optim.Adam(worker_model.parameters(), lr=config.learning_rate)
+            worker_optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
         else:
-            worker_optimizer = optim.AdamW(worker_model.parameters(), lr=config.learning_rate)
+            worker_optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
         
-        # FIX: Pass config.pad_token_id to worker
-        p = mp.Process(target=run_worker, args=(worker_model, worker_optimizer, train_loader, queues, worker_device, config.seed, config.pad_token_id))
+        # Pass rank to worker
+        p = mp.Process(target=run_worker, args=(model, worker_optimizer, train_loader, queues, worker_device, config.seed, config.pad_token_id, rank))
         p.start()
         processes.append(p)
-
+    del worker_optimizer
     device = torch.device("cuda:0")
     model = model.to(device)
+    
+    # Reset Master Peak Memory
+    torch.cuda.reset_peak_memory_stats(device)
+    
     T = config.max_steps
     P = min(config.P, T)
-    thresh = config.threshold
+    
     models = [None] * (T + 1)
     optimizers = [None] * (T + 1)
     
-    begin_idx, end_idx = 0, P
-    total_iters, total_Grad = 0, 0
+    # Initialize variables
+    begin_idx = 0
+    end_idx = P
+    total_iters = 0
+    total_Grad = 0
     running_loss = 0.0
     running_perplexity = 0.0
     total_consumed_tokens = 0
-
+    thresh = config.threshold
+    best_ppl = float('inf') 
+    
     for step in range(P + 1):
         models[step] = model.clone(device)
         if config.optimizer_type.lower() == 'sgd':
@@ -467,17 +472,21 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
         else:
             optimizers[step] = optim.AdamW(models[step].parameters(), lr=config.learning_rate)
 
-    pbar = tqdm(total=T, desc="Starting parallel training...")
-    total_comm_time = 0.0
-    start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start_event.record()
+    main_scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizers[begin_idx],
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=T
+    )
+
+    pbar = tqdm(total=T, initial=begin_idx, desc="Starting parallel training...")
+    start_time = time.time()
 
     while begin_idx < T:
-        start_time_per_iter = time.time()
         parallel_len = end_idx - begin_idx
         pred_f = [None] * parallel_len
         metrics = [None] * parallel_len
-        comm_start_time = time.time()
+        
         for i in range(parallel_len):
             step = begin_idx + i
             params = [p.data for p in models[step].get_params()]
@@ -488,8 +497,6 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
             _i = _step - begin_idx
             pred_f[_i] = _grads
             metrics[_i] = _metrics
-        time_comm_per_iter = time.time() - comm_start_time
-        total_comm_time += time_comm_per_iter
 
         rollout_model = models[begin_idx]
         rollout_optimizer = optimizers[begin_idx]
@@ -497,9 +504,16 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
 
         for i in range(parallel_len):
             step = begin_idx + i
+
+            current_lr = main_scheduler.get_last_lr()[0]
+            for param_group in rollout_optimizer.param_groups:
+                param_group['lr'] = current_lr
+
             rollout_model.set_grads_from_grads(pred_f[i])
             rollout_optimizer.step()
+            main_scheduler.step()
             rollout_optimizer.zero_grad()
+            
             error = rollout_model.compute_error_from_model(models[step + 1])
             
             if config.adaptivity_type == 'median' and i == parallel_len // 2:
@@ -517,10 +531,11 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
                 cur_perplexity = _metrics['perplexity']
                 running_loss += _metrics['loss']
                 running_perplexity += _metrics['perplexity']
-                total_consumed_tokens += _metrics['num_tokens']
+            total_consumed_tokens += _metrics['num_tokens']
             
             if ind is not None:
                 models[step + 1] = rollout_model.clone(device, models[step + 1])
+            
             total_Grad += 1
 
         thresh = thresh * config.ema_decay + errors_all * (1 - config.ema_decay)
@@ -538,80 +553,109 @@ def train_loop_parallel(config, model, train_loader, test_loader, csv_logger):
 
         begin_idx = new_begin_idx
         end_idx = new_end_idx
-        time_per_iter = time.time() - start_time_per_iter
-        time_comp_per_iter = time_per_iter - time_comm_per_iter
 
         avg_loss = running_loss / begin_idx if begin_idx > 0 else 0
         avg_perplexity = torch.exp(torch.tensor(avg_loss))
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed = start_event.elapsed_time(end_event) / 1000.0
-        elapsed_str = str(timedelta(seconds=int(elapsed)))
         
-        pbar.set_description(f'Loss: {avg_loss:.4f} |cur loss:{cur_loss:.4f}| PPL: {avg_perplexity:.2f} |cur PPL: {cur_perplexity:.2f} | Time: {elapsed_str}')          
+        elapsed = time.time() - start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+        
+        pbar.set_description(f'LR: {current_lr:.8f} |progres:{progress}| Loss: {avg_loss:.4f} |cur loss:{cur_loss:.4f}| PPL: {avg_perplexity:.2f} |cur PPL: {cur_perplexity:.2f} | Time: {elapsed_str}')            
         csv_logger.log({
             "Iter": total_iters,
+            "LR": current_lr,
             "Train_Loss": avg_loss,
             "Train_Perplexity": avg_perplexity,
             "Original_Steps": begin_idx,
             "num_tokens": total_consumed_tokens,
-            "time_per_iter": time_per_iter,
-            "time_comm_per_iter": time_comm_per_iter,
-            "time_comp_per_iter": time_comp_per_iter
         })
+        
+        if total_iters % config.val_interval == 0:
+            current_model = models[begin_idx] 
+            val_loss, val_ppl = evaluate_model(current_model, test_loader, device)
+            
+            if val_ppl < best_ppl:
+                best_ppl = val_ppl
+                
+            pbar.write(f"\n[Validation at para step {begin_idx}]|{config.modelscope_name}|{config.dataset_name}|{config.optimizer_type}|{config.batch_size}|{config.learning_rate}| Test PPL: {val_ppl:.2f} | Best PPL: {best_ppl:.2f}")
 
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed = start_event.elapsed_time(end_event) / 1000.0
+            csv_logger.log({
+                "Iter": total_iters,
+                "Original_Steps": begin_idx,
+                "Val_Loss": val_loss,
+                "Val_Perplexity": val_ppl,
+                "Best_Perplexity": best_ppl
+            })
+            csv_logger.save()
+        # Cleanup old steps to save memory
+        for step_j in range(begin_idx, new_begin_idx):
+            models[step_j] = None
+            optimizers[step_j] = None
+    elapsed = time.time() - start_time
+    elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
     pbar.close()
 
+    # --- Terminate Workers and Collect Memory ---
+    peak_memories = {}
+    
+    # Send poison pill
     for _ in processes:
         queues[0].put(None)
+    
+    # Collect memory from workers
+    for _ in processes:
+        rank, peak_mem = queues[0].get()
+        peak_memories[f"GPU_{rank}_peak_memory_MB"] = peak_mem / (1024 ** 2)
+
+    # Collect master memory
+    master_peak = torch.cuda.max_memory_allocated(device)
+    peak_memories[f"GPU_0_peak_memory_MB"] = master_peak / (1024 ** 2)
+    
+    # Find global max
+    all_peaks = [v for v in peak_memories.values()]
+    max_peak_mb = max(all_peaks) if all_peaks else 0.0
+
     for p in processes:
         p.join()
         
     final_model = models[T]
     del models, optimizers
-    test_loss, test_perplexity, test_accuracy, test_f1 = evaluate_model(final_model, test_loader, device)
-    upper_bound = total_iters * P
+    test_loss, test_perplexity = evaluate_model(final_model, test_loader, device)
     m = total_Grad / T
     
-    csv_logger.log({
-        # "final_test_loss": test_loss,
+    log_data = {
         "final_test_perplexity": test_perplexity,
-        # "final_test_accuracy": test_accuracy,
-        # "final_test_f1": test_f1,
         "total_consumed_tokens": total_consumed_tokens,
         "time": elapsed,
-        # "time_comm": total_comm_time,
-        # "time_step": elapsed - total_comm_time,
         "K": total_iters,
-        # "G": total_Grad,
-        # "upper_bound": upper_bound,
-        "m": m
-    })
+        "m": m,
+        "peak_memory_max_MB": max_peak_mb
+    }
+    log_data.update(peak_memories)
+    
+    csv_logger.log(log_data)
     print(f"\nTraining completed in {elapsed_str}")
     print(f"Total Tokens Consumed: {total_consumed_tokens}")
     print(f"final_test_perplexity: {test_perplexity}")
+    print(f"Effective speed-up: {T/total_iters:.2f}x")
+    print(f"m: {m}")
+    print(f"Maximum GPU Peak Memory: {max_peak_mb:.2f} MB")
+    
     return final_model
 
 # =================================================================
-# Naive Data Parallel (New Implementation)
+# Naive Data Parallel
 # =================================================================
 
 def run_naive_dp_worker(rank, world_size, config, queues):
-    """
-    Worker process for Naive Data Parallel.
-    Uses DistributedSampler for data partitioning.
-    Uses MP Queues for communication (Params Down, Grads Up).
-    """
     device = torch.device(f"cuda:{rank}")
     
-    # 1. Create local model copy
+    # Reset memory stats
+    torch.cuda.reset_peak_memory_stats(device)
+    
     model_wrapper = ModelFactory.create_model(config).to(device)
     model = model_wrapper
     
-    # 2. Create Optimizer (needed to clear grad, though step is virtually done by master logic)
     if config.optimizer_type.lower() == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
     elif config.optimizer_type.lower() == 'adam':
@@ -619,24 +663,20 @@ def run_naive_dp_worker(rank, world_size, config, queues):
     else:
         optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    # 3. Get Data Loader with DistributedSampler
     train_loader, _ = get_dataloaders(config, rank=rank, world_size=world_size)
     data_iter = iter(train_loader)
     
     while True:
-        # A. Wait for Parameters from Master
         ret = queues[0].get()
         if ret is None:
-            return # Poison pill
+            # Report peak memory before exiting
+            peak_memory = torch.cuda.max_memory_allocated(device)
+            queues[2].put((rank, peak_memory))
+            return 
             
         params, step = ret
-        
-        # B. Update local model parameters
         model.set_params(params, clone=False)
         
-        # C. Compute Gradients
-        # Note: We reuse take_step logic but we don't need the step return value for logic control
-        # ensuring seeds are aligned helps reproducibility
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -644,8 +684,6 @@ def run_naive_dp_worker(rank, world_size, config, queues):
             batch = next(data_iter)
             
         batch = to_device(batch, device)
-        
-        # Count tokens
         num_tokens = count_real_tokens(batch, config.pad_token_id)
         
         if 'labels' not in batch:
@@ -656,7 +694,6 @@ def run_naive_dp_worker(rank, world_size, config, queues):
         loss = outputs.loss
         loss.backward()
         
-        # D. Send Gradients and Metrics back to Master
         grads = [p.grad for p in model.get_params()]
         
         metrics = {
@@ -669,12 +706,6 @@ def run_naive_dp_worker(rank, world_size, config, queues):
 
 
 def train_loop_naive_dp(config, model, train_loader, test_loader, csv_logger):
-    """
-    Naive Data Parallel Master Loop.
-    Rank 0 acts as Master AND Worker 0.
-    Rank 1..N are purely workers.
-    Communication is purely via Queues (no NCCL/TorchDist).
-    """
     world_size = config.device_count
     if world_size <= 1:
         print("Only one GPU found, falling back to serial training.")
@@ -682,21 +713,21 @@ def train_loop_naive_dp(config, model, train_loader, test_loader, csv_logger):
 
     print(f"Starting Naive Data Parallel with {world_size} devices...")
     
-    # Setup Multiprocessing
     mp.set_start_method('spawn', force=True)
-    queues = (mp.Queue(), mp.Queue()) # 0: Params (Master->Workers), 1: Grads (Workers->Master)
+    # Added 3rd queue
+    queues = (mp.Queue(), mp.Queue(), mp.Queue()) 
     processes = []
 
-    # Start Workers (Rank 1 to N-1)
     for rank in range(1, world_size):
-        # Note: run_naive_dp_worker will instantiate its own model/dataset
         p = mp.Process(target=run_naive_dp_worker, args=(rank, world_size, config, queues))
         p.start()
         processes.append(p)
 
-    # Setup Master (Rank 0)
     device = torch.device("cuda:0")
     model = model.to(device)
+    
+    # Reset memory stats (Master)
+    torch.cuda.reset_peak_memory_stats(device)
     
     if config.optimizer_type.lower() == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
@@ -705,27 +736,29 @@ def train_loop_naive_dp(config, model, train_loader, test_loader, csv_logger):
     else:
         optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    # Master Dataloader (Rank 0)
-    # Note: train_loader passed in main is already configured for rank 0 if config isn't parallel
-    # But strictly speaking, we should ensure it uses DistributedSampler for Rank 0
-    # Re-getting loader to be safe and consistent with workers
+    scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=config.max_steps
+    )
+
     train_loader_master, _ = get_dataloaders(config, rank=0, world_size=world_size)
     data_iter = iter(train_loader_master)
     
     running_loss = 0.0
     total_consumed_tokens = 0
     start_time = time.time()
+    best_ppl = float('inf')
     
     pbar = tqdm(total=config.max_steps, desc="Starting Naive DP training...")
     
     for step in range(config.max_steps):
         current_params = [p.data for p in model.get_params()]
         
-        # 1. Broadcast Parameters to all workers
         for _ in range(1, world_size):
             queues[0].put((current_params, step))
             
-        # 2. Compute Gradients Locally (Rank 0)
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -743,80 +776,101 @@ def train_loop_naive_dp(config, model, train_loader, test_loader, csv_logger):
         loss = outputs.loss
         loss.backward()
         
-        # Local Gradients
         grad_accumulator = [p.grad if p.grad is not None else torch.zeros_like(p.data) for p in model.get_params()]
         
-        # Track metrics
         step_loss = loss.item()
         step_tokens = num_tokens_local
         
-        # 3. Receive Gradients from Workers
         for _ in range(1, world_size):
             rank_w, grads_w, metrics_w = queues[1].get()
             
-            # Aggregate Gradients
             for acc, g_w in zip(grad_accumulator, grads_w):
                 if g_w is not None:
                     acc.add_(g_w.to(device))
             
-            # Aggregate Metrics
             step_loss += metrics_w['loss']
             step_tokens += metrics_w['num_tokens']
             
-        # 4. Average Gradients
         for acc in grad_accumulator:
             acc.div_(world_size)
             
-        # 5. Apply Gradients to Master Model
         model.set_grads_from_grads(grad_accumulator)
         optimizer.step()
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         
-        # 6. Logging
         avg_loss_step = step_loss / world_size
         running_loss += avg_loss_step
         total_consumed_tokens += step_tokens
         
-        if (step + 1) % 5 == 0:
-            avg_loss_cumulative = running_loss / (step + 1)
-            avg_perplexity = np.exp(avg_loss_cumulative)
-            elapsed = time.time() - start_time
-            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-            
-            pbar.set_description(f'Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
-            
+        avg_loss_cumulative = running_loss / (step + 1)
+        avg_perplexity = np.exp(avg_loss_cumulative)
+        elapsed = time.time() - start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+        
+        pbar.set_description(f'LR: {current_lr:.8f} | Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
+        
+        csv_logger.log({
+            "Iter": step + 1,
+            "LR": current_lr,
+            "Train_Loss": avg_loss_cumulative,
+            "Train_Perplexity": avg_perplexity,
+            "Original_Steps": step + 1,
+            "num_tokens": total_consumed_tokens,
+        })
+        pbar.update(1)
+
+        if (step + 1) % config.val_interval == 0:
+            val_loss, val_ppl = evaluate_model(model, test_loader, device)
+            if val_ppl < best_ppl:
+                best_ppl = val_ppl
+            pbar.write(f"\n[Validation at step {step + 1}]|{config.modelscope_name}|{config.dataset_name}|{config.optimizer_type}|{config.batch_size}|{config.learning_rate}| Test PPL: {val_ppl:.2f} | Best PPL: {best_ppl:.2f}")
             csv_logger.log({
                 "Iter": step + 1,
-                "Train_Loss": avg_loss_cumulative,
-                "Train_Perplexity": avg_perplexity,
-                "Original_Steps": step + 1,
-                "num_tokens": total_consumed_tokens,
-                "time_per_iter": elapsed / (step + 1)
+                "Val_Loss": val_loss,
+                "Val_Perplexity": val_ppl,
+                "Best_Perplexity": best_ppl
             })
-        pbar.update(1)
+            csv_logger.save()
 
     pbar.close()
     
-    # Cleanup Workers
+    # --- Collect Memory ---
+    peak_memories = {}
     for _ in processes:
         queues[0].put(None)
+        
+    for _ in processes:
+        rank, peak_mem = queues[2].get()
+        peak_memories[f"GPU_{rank}_peak_memory_MB"] = peak_mem / (1024 ** 2)
+
+    master_peak = torch.cuda.max_memory_allocated(device)
+    peak_memories[f"GPU_0_peak_memory_MB"] = master_peak / (1024 ** 2)
+    
+    all_peaks = [v for v in peak_memories.values()]
+    max_peak_mb = max(all_peaks) if all_peaks else 0.0
+
     for p in processes:
         p.join()
 
     elapsed = time.time() - start_time
-    test_loss, test_ppl, test_acc, test_f1 = evaluate_model(model, test_loader, device)
+    test_loss, test_ppl = evaluate_model(model, test_loader, device)
     
-    csv_logger.log({
+    log_data = {
         "final_test_loss": test_loss,
         "final_test_perplexity": test_ppl,
-        "final_test_accuracy": test_acc,
-        "final_test_f1": test_f1,
         "total_consumed_tokens": total_consumed_tokens,
-        "time": elapsed
-    })
+        "time": elapsed,
+        "peak_memory_max_MB": max_peak_mb
+    }
+    log_data.update(peak_memories)
+    
+    csv_logger.log(log_data)
     csv_logger.finish()
     print(f"\nNaive DP Training completed in {str(timedelta(seconds=int(elapsed)))}")
     print(f"\ntotal_consumed_tokens {total_consumed_tokens}")
     print(f"\nfinal_test_perplexity {test_ppl}")
+    print(f"Maximum GPU Peak Memory: {max_peak_mb:.2f} MB")
     return model
 
 # =================================================================
@@ -835,11 +889,15 @@ def ddp_cleanup():
 def run_ddp_worker(rank, world_size, config, csv_logger_filename):
     ddp_setup(rank, world_size)
     
+    device = torch.device(f"cuda:{rank}")
+    
+    # Reset memory stats
+    torch.cuda.reset_peak_memory_stats(device)
+    
     csv_logger = CSVLogger(csv_logger_filename) if rank == 0 else None
     
     train_loader, test_loader = get_dataloaders(config, rank=rank, world_size=world_size)
     
-    device = torch.device(f"cuda:{rank}")
     model_wrapper = ModelFactory.create_model(config).to(device)
     ddp_model = DDP(model_wrapper.model, device_ids=[rank]) 
     
@@ -851,10 +909,18 @@ def run_ddp_worker(rank, world_size, config, csv_logger_filename):
         optimizer = optim.AdamW(ddp_model.parameters(), lr=config.learning_rate)
         
     model = ddp_model 
+
+    scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=config.max_steps
+    )
     
     start_time = time.time()
     running_loss = 0.0
     total_consumed_tokens = 0
+    best_ppl = float('inf')
     
     if rank == 0:
         pbar = tqdm(total=config.max_steps, desc="Starting DDP training...")
@@ -865,13 +931,11 @@ def run_ddp_worker(rank, world_size, config, csv_logger_filename):
         try:
             batch = next(data_iter)
         except StopIteration:
-            # train_loader.sampler.set_epoch(step) # FIX: Added set_epoch for correctness
             data_iter = iter(train_loader)
             batch = next(data_iter)
             
         batch = to_device(batch, device)
         
-        # FIX: Count real tokens
         real_tokens = count_real_tokens(batch, config.pad_token_id)
         num_tokens_local = torch.tensor(real_tokens, device=device)
         
@@ -883,6 +947,7 @@ def run_ddp_worker(rank, world_size, config, csv_logger_filename):
         loss = outputs.loss
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
         dist.all_reduce(loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(num_tokens_local, op=dist.ReduceOp.SUM)
@@ -894,41 +959,64 @@ def run_ddp_worker(rank, world_size, config, csv_logger_filename):
         total_consumed_tokens += total_tokens_step
         
         if rank == 0:
-            if (step + 1) % 5 == 0:
-                avg_loss_cumulative = running_loss / (step + 1)
-                avg_perplexity = np.exp(avg_loss_cumulative)
-                elapsed = time.time() - start_time
-                elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-                
-                pbar.set_description(f'Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
-                
+            avg_loss_cumulative = running_loss / (step + 1)
+            avg_perplexity = np.exp(avg_loss_cumulative)
+            elapsed = time.time() - start_time
+            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+            current_lr = scheduler.get_last_lr()[0]
+            
+            pbar.set_description(f'LR: {current_lr:.8f} | Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
+            
+            csv_logger.log({
+                "Iter": step + 1,
+                "LR": current_lr,
+                "Train_Loss": avg_loss_cumulative,
+                "Train_Perplexity": avg_perplexity,
+                "Original_Steps": step + 1,
+                "num_tokens": total_consumed_tokens,
+            })
+            pbar.update(1)
+
+            if (step + 1) % config.val_interval == 0:
+                val_loss, val_ppl = evaluate_model(model_wrapper, test_loader, device)
+                if val_ppl < best_ppl:
+                    best_ppl = val_ppl
+                pbar.write(f"\n[Validation at step {step + 1}]|{config.modelscope_name}|{config.dataset_name}|{config.optimizer_type}|{config.batch_size}|{config.learning_rate}| Test PPL: {val_ppl:.2f} | Best PPL: {best_ppl:.2f}")
                 csv_logger.log({
                     "Iter": step + 1,
-                    "Train_Loss": avg_loss_cumulative,
-                    "Train_Perplexity": avg_perplexity,
-                    "Original_Steps": step + 1,
-                    "num_tokens": total_consumed_tokens,
-                    "time_per_iter": elapsed / (step + 1) 
+                    "Val_Loss": val_loss,
+                    "Val_Perplexity": val_ppl,
+                    "Best_Perplexity": best_ppl
                 })
-            pbar.update(1)
-            
+                csv_logger.save()
+
     if rank == 0:
         pbar.close()
+        
+    # --- Capture and Aggregate Peak Memory ---
+    peak_memory = torch.cuda.max_memory_allocated(device)
+    # Convert to Tensor for all_reduce
+    peak_tensor = torch.tensor(peak_memory, device=device)
+    dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+    max_peak_memory_mb = peak_tensor.item() / (1024 ** 2)
+    
+    if rank == 0:
         elapsed = time.time() - start_time
-        test_loss, test_ppl, test_acc, test_f1 = evaluate_model(model_wrapper, test_loader, device)
+        test_loss, test_ppl = evaluate_model(model_wrapper, test_loader, device)
         
         csv_logger.log({
             "final_test_loss": test_loss,
             "final_test_perplexity": test_ppl,
-            "final_test_accuracy": test_acc,
-            "final_test_f1": test_f1,
             "total_consumed_tokens": total_consumed_tokens,
-            "time": elapsed
+            "time": elapsed,
+            "peak_memory_max_MB": max_peak_memory_mb
         })
         csv_logger.finish()
         print(f"\nDDP Training completed in {str(timedelta(seconds=int(elapsed)))}")
         print(f"Total Tokens Consumed: {total_consumed_tokens}")
         print(f"final_test_perplexity: {test_ppl}")
+        print(f"Maximum GPU Peak Memory: {max_peak_memory_mb:.2f} MB")
+        
     ddp_cleanup()
 
 def train_loop_ddp(config, csv_logger):
@@ -950,12 +1038,21 @@ def train_loop_ddp(config, csv_logger):
 # =================================================================
 
 def train_loop_deepspeed(config, csv_logger):
-    world_size = dist.get_world_size()
+
     if not DEEPSPEED_AVAILABLE:
         raise ImportError("DeepSpeed is not installed.")
+
+    # FIX: FORCE NCCL to avoid MPI errors
+    deepspeed.init_distributed(dist_backend="nccl") 
+    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Reset memory stats
+    torch.cuda.reset_peak_memory_stats()
+    
     ds_config = {
-        "train_batch_size": config.batch_size * config.device_count, 
-        "train_micro_batch_size_per_gpu": config.batch_size // world_size if world_size > 0 else config.batch_size, # Fix for single gpu debug
+        "train_micro_batch_size_per_gpu": config.batch_size // world_size if world_size > 0 else config.batch_size, 
         "gradient_accumulation_steps": 1,
         "steps_per_print": 5,
         "optimizer": {
@@ -968,7 +1065,7 @@ def train_loop_deepspeed(config, csv_logger):
         "fp16": { "enabled": False },
         "bf16": { "enabled": True },
         "zero_optimization": {
-            "stage": 2, 
+            "stage": config.stage, 
             "allgather_partitions": True,
             "allgather_bucket_size": 2e8,
             "reduce_scatter": True,
@@ -986,18 +1083,28 @@ def train_loop_deepspeed(config, csv_logger):
         model_parameters=model_wrapper.parameters(),
         config=ds_config
     )
+
+    # Correctly handle DeepSpeed Optimizer wrapper for the scheduler
+    real_optimizer = optimizer
+    if hasattr(optimizer, "optimizer"):
+        real_optimizer = optimizer.optimizer
+
+    scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=real_optimizer, # Use the unwrapped optimizer here
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=config.max_steps
+    )
     
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    # Note: get_dataloaders populates config.pad_token_id
     train_loader, test_loader = get_dataloaders(config, rank=rank, world_size=world_size)
     
     start_time = time.time()
     running_loss = 0.0
     total_consumed_tokens = 0
+    best_ppl = float('inf')
     
     if rank == 0:
-        pbar = tqdm(total=config.max_steps, desc="Starting DeepSpeed (ZeRO-2)...")
+        pbar = tqdm(total=config.max_steps, desc=f"Starting DeepSpeed (ZeRO-{config.stage})...")
     
     data_iter = iter(train_loader)
     
@@ -1005,13 +1112,11 @@ def train_loop_deepspeed(config, csv_logger):
         try:
             batch = next(data_iter)
         except StopIteration:
-            # train_loader.sampler.set_epoch(step)
             data_iter = iter(train_loader)
             batch = next(data_iter)
             
         batch = to_device(batch, model_engine.device)
         
-        # FIX: Count real tokens
         real_tokens = count_real_tokens(batch, config.pad_token_id)
         num_tokens_local = torch.tensor(real_tokens, device=model_engine.device)
         
@@ -1021,6 +1126,7 @@ def train_loop_deepspeed(config, csv_logger):
         loss = model_engine(batch['input_ids'], labels=batch['labels']).loss
         model_engine.backward(loss)
         model_engine.step()
+        scheduler.step()
         
         dist.all_reduce(loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(num_tokens_local, op=dist.ReduceOp.SUM)
@@ -1032,47 +1138,72 @@ def train_loop_deepspeed(config, csv_logger):
         total_consumed_tokens += total_tokens_step
         
         if rank == 0:
-            if (step + 1) % 5 == 0:
-                avg_loss_cumulative = running_loss / (step + 1)
-                avg_perplexity = np.exp(avg_loss_cumulative)
-                elapsed = time.time() - start_time
-                elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-                pbar.set_description(f'Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
-                
+            avg_loss_cumulative = running_loss / (step + 1)
+            avg_perplexity = np.exp(avg_loss_cumulative)
+            elapsed = time.time() - start_time
+            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+            current_lr = scheduler.get_last_lr()[0]
+            
+            pbar.set_description(f'LR: {current_lr:.8f} | Loss: {avg_loss_cumulative:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
+            
+            csv_logger.log({
+                "Iter": step + 1,
+                "LR": current_lr,
+                "Train_Loss": avg_loss_cumulative,
+                "Train_Perplexity": avg_perplexity,
+                "Original_Steps": step + 1,
+                "num_tokens": total_consumed_tokens
+            })
+            pbar.update(1)
+
+            if rank == 0 and (step + 1) % config.val_interval == 0:
+                model_wrapper.model = model_engine.module
+                val_loss, val_ppl = evaluate_model(model_wrapper, test_loader, model_engine.device)
+                if val_ppl < best_ppl:
+                    best_ppl = val_ppl
+                pbar.write(f"\n[Validation at step {step + 1}]|{config.modelscope_name}|{config.dataset_name}|{config.optimizer_type}|{config.batch_size}|{config.learning_rate}| Test PPL: {val_ppl:.2f} | Best PPL: {best_ppl:.2f}")
                 csv_logger.log({
                     "Iter": step + 1,
-                    "Train_Loss": avg_loss_cumulative,
-                    "Train_Perplexity": avg_perplexity,
-                    "Original_Steps": step + 1,
-                    "num_tokens": total_consumed_tokens,
-                    "time_per_iter": elapsed / (step + 1)
+                    "Val_Loss": val_loss,
+                    "Val_Perplexity": val_ppl,
+                    "Best_Perplexity": best_ppl
                 })
-            pbar.update(1)
-            
+                csv_logger.save()
+
     if rank == 0:
         pbar.close()
-        elapsed = time.time() - start_time
-        model_wrapper.model = model_engine.module
-        test_loss, test_ppl, test_acc, test_f1 = evaluate_model(model_wrapper, test_loader, model_engine.device)
-        
+
+    # --- Capture and Aggregate Peak Memory ---
+    peak_memory = torch.cuda.max_memory_allocated(model_engine.device)
+    peak_tensor = torch.tensor(peak_memory, device=model_engine.device)
+    elapsed = time.time() - start_time
+    dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+    max_peak_memory_mb = peak_tensor.item() / (1024 ** 2)
+    dist.barrier()
+    
+    
+    # print("rank first ", rank)
+    model_wrapper.model = model_engine.module
+    test_loss, test_ppl = evaluate_model(model_wrapper, test_loader, model_engine.device)
+    # print("rank second", rank)
+    dist.barrier()
+    if rank == 0:
         csv_logger.log({
             "final_test_loss": test_loss,
             "final_test_perplexity": test_ppl,
-            "final_test_accuracy": test_acc,
-            "final_test_f1": test_f1,
             "total_consumed_tokens": total_consumed_tokens,
-            "time": elapsed
+            "time": elapsed,
+            "peak_memory_max_MB": max_peak_memory_mb
         })
         print(f"\nDeepSpeed Training completed in {str(timedelta(seconds=int(elapsed)))}")
         print({
-            # "final_test_loss": test_loss,
+            "final_test_loss": test_loss,
             "final_test_perplexity": test_ppl,
-            # "final_test_accuracy": test_acc,
-            # "final_test_f1": test_f1,
             "total_consumed_tokens": total_consumed_tokens,
-            "time": elapsed
+            "time": elapsed,
+            "peak_memory_max_MB": max_peak_memory_mb
         })
-
+    
 # ==========================
 # Serial Loop 
 # ==========================
@@ -1080,18 +1211,30 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
+    # Reset memory stats
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    
     if config.optimizer_type.lower() == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
     elif config.optimizer_type.lower() == 'adam':
         optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     else: 
         optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    
+    scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=config.max_steps
+    )
         
     start_time = time.time()
     running_loss = 0.0
-    running_total = 0    
+    running_total = 0     
     total_consumed_tokens = 0 
-
+    best_ppl = float('inf')
+    
     pbar = tqdm(total=config.max_steps, desc="Starting serial training...")
     data_iter = iter(train_loader)
     
@@ -1104,7 +1247,6 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
             
         batch = to_device(batch, device)
         
-        # FIX: Count real tokens
         num_tokens = count_real_tokens(batch, config.pad_token_id)
         total_consumed_tokens += num_tokens
 
@@ -1113,43 +1255,66 @@ def train_loop_serial(config, model, train_loader, test_loader, csv_logger):
         loss = outputs.loss
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
         running_loss += loss.item()
         running_total += batch['input_ids'].size(0)
         
-        if (step + 1) % 5 == 0:
-            avg_loss = running_loss / (step + 1)
-            avg_perplexity = torch.exp(torch.tensor(avg_loss))
-            elapsed = time.time() - start_time
-            elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-            
-            pbar.set_description(f'Loss: {avg_loss:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
-            
+        avg_loss = running_loss / (step + 1)
+        avg_perplexity = torch.exp(torch.tensor(avg_loss))
+        elapsed = time.time() - start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
+        current_lr = scheduler.get_last_lr()[0]
+        
+        pbar.set_description(f'LR: {current_lr:.8f} | Loss: {avg_loss:.4f} | PPL: {avg_perplexity:.2f} | Time: {elapsed_str}')
+        
+        csv_logger.log({
+            "Iter": step + 1,
+            "LR": current_lr,
+            "Train_Loss": avg_loss,
+            "Train_Perplexity": avg_perplexity,
+            "Original_Steps": step + 1,
+            "num_tokens": total_consumed_tokens 
+        })
+        pbar.update(1)
+
+        if (step + 1) % config.val_interval == 0:
+            val_loss, val_ppl = evaluate_model(model, test_loader, device)
+            if val_ppl < best_ppl:
+                best_ppl = val_ppl
+            pbar.write(f"\n[Validation at step {step + 1}]|{config.modelscope_name}|{config.dataset_name}|{config.optimizer_type}|{config.batch_size}|{config.learning_rate}| Test PPL: {val_ppl:.2f} | Best PPL: {best_ppl:.2f}")
             csv_logger.log({
                 "Iter": step + 1,
-                "Train_Loss": avg_loss,
-                "Train_Perplexity": avg_perplexity,
-                "Original_Steps": step + 1,
-                "num_tokens": total_consumed_tokens 
+                "Val_Loss": val_loss,
+                "Val_Perplexity": val_ppl,
+                "Best_Perplexity": best_ppl
             })
-        pbar.update(1)
+            csv_logger.save()
     
     pbar.close()
+    
+    # --- Measure Peak Memory ---
+    peak_memory_max_mb = 0.0
+    if device.type == 'cuda':
+        peak_memory_bytes = torch.cuda.max_memory_allocated(device)
+        peak_memory_max_mb = peak_memory_bytes / (1024 ** 2)
+        print(f"Single GPU Peak Memory: {peak_memory_max_mb:.2f} MB")
+        
     elapsed = time.time() - start_time
-    test_loss, test_perplexity, test_accuracy, test_f1 = evaluate_model(model, test_loader, device)
+    test_loss, test_perplexity = evaluate_model(model, test_loader, device)
+    elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
     print(f"\nTraining completed in {elapsed_str}")
     print(f"Total Tokens Consumed: {total_consumed_tokens}")
     print(f"final_test_perplexity: {test_perplexity}")
+    
     csv_logger.log({
         "final_test_loss": test_loss,
         "final_test_perplexity": test_perplexity,
-        "final_test_accuracy": test_accuracy,
-        "final_test_f1": test_f1,
         "total_consumed_tokens": total_consumed_tokens, 
-        "time":elapsed
+        "time":elapsed,
+        "peak_memory_max_MB": peak_memory_max_mb
     })
-    elapsed_str = str(timedelta(seconds=int(elapsed))).split('.')[0]
-
+    
     return model
 
 # ==========================
@@ -1174,7 +1339,16 @@ def setup_arg_parser():
     parser.add_argument('--max_length', type=int, help='Maximum sequence length')
     parser.add_argument('--output_csv', type=str, help='Output CSV file path')
     parser.add_argument('--local_rank', type=int, default=-1, help='Local rank passed by deepspeed/torchrun')
+    parser.add_argument('--stage', type=int, default=1, help='deepspeed stage')
+    # Added
+    parser.add_argument('--val_interval', type=int, help='Validation interval')
     
+    # Scheduler
+    parser.add_argument('--lr_scheduler_type', type=str, default='cosine', 
+                        choices=['linear', 'cosine', 'constant'], 
+                        help='learning rate scheduler type')
+    parser.add_argument('--warmup_steps', type=int, default=100, help='number of warmup steps')
+
     if DEEPSPEED_AVAILABLE:
         parser = deepspeed.add_config_arguments(parser)
         
@@ -1208,13 +1382,10 @@ def train_with_config(config=None, csv_logger=None):
              csv_logger.finish()
 
     elif config.training_mode.lower() == "naive_dp":
-        # For Naive DP, dataloaders are handled inside the loop/workers to ensure correct sampler setup per process
-        # We create a dummy model wrapper here for consistency if needed, but train_loop_naive_dp instantiates its own
         model = ModelFactory.create_model(config)
-        # Test loader is needed for evaluation at end
         _, test_loader = get_dataloaders(config)
         train_loop_naive_dp(config, model, None, test_loader, csv_logger)
-             
+              
     else: # Serial
         train_loader, test_loader = get_dataloaders(config)
         model = ModelFactory.create_model(config)
@@ -1229,11 +1400,18 @@ def main():
     config.update_from_args(args)
 
     directory_path = os.path.join(
-    "./PASO/new_exp_results", config.modelscope_name,
-        f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}"
+    "./PASO_standard/2026_01_08", config.modelscope_name,
+        f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}_sched_{config.lr_scheduler_type}_warmup_{config.warmup_steps}"
     )
-    output_csv = directory_path + f"/{config.training_mode}_{config.adaptivity_type}_P_{config.P}_tor_{config.threshold}_ema_{config.ema_decay}.csv"
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path, exist_ok=True)
+    if config.training_mode == "deepspeed":
+        output_csv = directory_path + f"/{config.training_mode}_stage_{config.stage}.csv"
+    else:
+        output_csv = directory_path + f"/{config.training_mode}_{config.adaptivity_type}_P_{config.P}_tor_{config.threshold}_ema_{config.ema_decay}.csv"
     
+    config.checkpoint_dir = directory_path 
+
     csv_logger = CSVLogger(output_csv) if output_csv else CSVLogger()
     
     train_with_config(config, csv_logger)

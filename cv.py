@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+This script merges the parallel training logic from cv.py with the 
+training features (AMP, LR scheduling, validation) from train_cifar10.py.
+It includes adaptation for MaskedAutoencoderViT (MAE) for classification.
 
+UPDATES:
+1. CSV Logging now uses 'append' mode to avoid rewriting history and ensure speed.
+2. Time accumulation logic ensures correct timing across restarts.
+"""
 
 import torch
 import torch.nn as nn
@@ -22,59 +30,71 @@ from torchvision import datasets
 from sklearn.metrics import precision_score, recall_score, f1_score
 import csv
 from datetime import datetime
+from transformers import get_scheduler
+from functools import partial
 
-# Note: The original code references 'MsDataset', 'DownloadMode', and 'Image' 
-# without importing them. These unresolved references remain as they are
-# part of un-used helper classes (ModelScopeDataset) in the original cv.py.
+
+from models.vit import ViT as ViTRegular
+from models.resnet_gn import ResNet50 
+from models.cnn import CNN 
 
 # ========== Config Class ==========
 class Config:
     """Training configuration parameters"""
     # Training parameters
-    batch_size = 64
-    n_epochs = None     # Number of epochs (overrides max_steps if set)
+    batch_size = 512
+    n_epochs = None      # Number of epochs (overrides max_steps if set)
     max_steps = 60000    # Total iteration steps (used if n_epochs is None)
-    learning_rate = 0.001
-    momentum = 0.9 #for SGD
-    optimizer_type = 'Adam'
+    learning_rate = 0.00001
+    momentum = 0.9 
+    optimizer_type = 'adam'
     training_mode = 'parallel'
+
+    # Scheduler parameters
+    lr_scheduler_type = 'constant' # 'linear', 'cosine', 'constant'
+    warmup_steps = 0
 
     # Acceleration configuration (for parallel mode)
     P = 7   # Window size
-    threshold = 0.00001 # Error threshold 0.993
-    ema_decay = 0.999 # Threshold exponential moving average decay rate
-    adaptivity_type = 'mean'  # Adaptive strategy: 'mean' or 'median'
+    threshold = 0.3 # Error threshold
+    ema_decay = 0.9999 # Threshold exponential moving average decay rate
+    adaptivity_type = 'median'  # Adaptive strategy: 'mean' or 'median'
+    dropout = 0.0
     
     # System configuration
-    seed = 42   # Random seed
-    device_count = torch.cuda.device_count()   # Number of GPUs
+    seed = 42    # Random seed
+    device_count = torch.cuda.device_count()    # Number of GPUs
 
     # Dataset and model configuration
-    dataset = 'cifar10' # Default dataset: 'cifar10' or 'tiny_imagenet'
-    model_name = 'cnn'   # Default using cnn
-    num_classes = 10 # Default number of classes
-    img_size = 32 # Default image size
+    dataset = 'cifar10' 
+    model_name = 'vit_small'    
+    num_classes = 10 
+    img_size = 32 
     pretrained = False
-    use_aug = True # Use data augmentation (RandomCrop, RandomHorizontalFlip)
+    use_aug = True 
+    
+    # ViT/MAE specific config for cifar10
+    patch_size = 4
+    dimhead = 512
 
     # Logging and Validation
-    use_amp = False # Use Automatic Mixed Precision (AMP)
-    val_interval = 500 # Validate every N steps
-    checkpoint_dir = './checkpoint' # Directory to save best model
+    use_amp = False 
+    val_interval = 100 
+    checkpoint_dir = './checkpoint' 
+    resume_checkpoint_path = './resume.pth' 
 
     def update_from_args(self, args):
         for key, value in vars(args).items():
             if hasattr(self, key) and value is not None:
                 setattr(self, key, value)
         
-        # Handle boolean flags
         if args.no_amp:
             self.use_amp = False
         if args.no_aug:
             self.use_aug = False
 
 
-# ========== CSV Logger ==========
+# ========== Optimized CSV Logger (Append Mode) ==========
 class CSVLogger:
     def __init__(self, filename=None):
         if filename is None:
@@ -82,37 +102,60 @@ class CSVLogger:
             filename = f"training_log_{timestamp}.csv"
         
         self.filename = filename
+        self.buffer = [] # Buffer for unsaved rows
         self.fieldnames = set()
-        self.rows = []
+        self.header_written = False
+        
         directory = os.path.dirname(self.filename)
         if directory:
             os.makedirs(directory, exist_ok=True)
-            
+
+        # Check if file exists and has content to determine if header exists
+        if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
+            self.header_written = True
+            # Read existing fieldnames to maintain order
+            try:
+                with open(self.filename, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames:
+                        self.fieldnames = set(reader.fieldnames)
+            except Exception as e:
+                print(f"Warning: Could not read header from existing file: {e}")
+
     def log(self, data):
-        # Add new fields if they don't exist
-        new_fields = set(data.keys()) - self.fieldnames
-        if new_fields:
-            self.fieldnames.update(new_fields)
-            # Re-save header if new fields added (or save at end)
-        
-        # Store the data
-        self.rows.append(data)
+        # Update known fields
+        self.fieldnames.update(data.keys())
+        # Add to buffer (do not write to disk yet)
+        self.buffer.append(data)
         
     def save(self):
-        # Write all data to CSV file
-        if not self.rows:
+        """Writes only the buffered (new) rows to the file in append mode."""
+        if not self.buffer:
             return
-            
-        with open(self.filename, 'w', newline='') as csvfile:
-            # Ensure consistent field order
+
+        # Determine mode: 'a' (append) if exists, 'w' (write) if new
+        mode = 'a' if os.path.exists(self.filename) else 'w'
+        
+        # If file doesn't exist or is empty, we need to write header
+        need_header = not self.header_written and (not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0)
+
+        with open(self.filename, mode, newline='') as csvfile:
+            # Sort fields for consistent column order
             sorted_fieldnames = sorted(list(self.fieldnames))
             writer = csv.DictWriter(csvfile, fieldnames=sorted_fieldnames)
-            writer.writeheader()
-            for row in self.rows:
-                # Fill missing keys with empty string
+            
+            if need_header:
+                writer.writeheader()
+                self.header_written = True
+            
+            for row in self.buffer:
+                # Ensure all fields are present (fill missing with empty string)
                 full_row = {field: row.get(field, "") for field in sorted_fieldnames}
                 writer.writerow(full_row)
-                
+        
+        # Clear the buffer after successful write
+        self.buffer = []
+
     def finish(self):
         self.save()
 
@@ -122,186 +165,8 @@ def to_device(batch, device):
     images, labels = batch
     return images.to(device), labels.to(device)
 
-def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    def norm_cdf(x):
-        return (1. + math.erf(x / math.sqrt(2.))) / 2.
-
-    if (mean < a - 2 * std) or (mean > b + 2 * std):
-        warnings.warn("mean is more than 2 std from [a, b] in nn.init.trunc_normal_. "
-                      "The distribution of values may be incorrect.",
-                      stacklevel=2)
-
-    with torch.no_grad():
-        l = norm_cdf((a - mean) / std)
-        u = norm_cdf((b - mean) / std)
-        tensor.uniform_(2 * l - 1, 2 * u - 1)
-        tensor.erfinv_()
-        tensor.mul_(std * math.sqrt(2.))
-        tensor.add_(mean)
-        tensor.clamp_(min=a, max=b)
-        return tensor
-
-
-# ========== Model Definitions ==========
-class PatchEmbed(nn.Module):
-    """Image to Patch Embedding"""
-    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.n_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        x = self.proj(x)
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-        return x
-
-
-class Attention(nn.Module):
-    """Multi-head Self-attention"""
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class MLP(nn.Module):
-    """MLP module"""
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class Block(nn.Module):
-    """Transformer Block"""
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class ViT(nn.Module):
-    """Vision Transformer Model"""
-    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=10, embed_dim=192, depth=12, 
-                 num_heads=12, mlp_ratio=4., qkv_bias=True, drop_rate=0.1, attn_drop_rate=0.):
-        super().__init__()
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-        num_patches = self.patch_embed.n_patches
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
-        self.blocks = nn.ModuleList([
-            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate)
-            for _ in range(depth)])
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
-        
-        trunc_normal_(self.pos_embed, std=0.02)
-        trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward(self, x):
-        x = self.patch_embed(x)
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_token, x), dim=1)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        x = self.head(x[:, 0])
-        return x
-
-class CNN(nn.Module):
-    """A simple Convolutional Neural Network"""
-    def __init__(self, num_classes=10, img_size=32):
-        super(CNN, self).__init__()
-        self.img_size = img_size
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        
-        feature_map_size = img_size // 4
-        flattened_size = 64 * feature_map_size * feature_map_size
-        
-        self.fc1 = nn.Linear(flattened_size, 128)
-        self.fc2 = nn.Linear(128, num_classes)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.pool(self.relu(self.conv1(x)))
-        x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-        
-class SimpleNN(nn.Module):
-    def __init__(self):
-        super(SimpleNN, self).__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(28 * 28, 256)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(256, 10)
-    
-    def forward(self,x):
-        x = self.flatten(x)
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x      
-
 
 class ModelWrapper(nn.Module):
-    """Model wrapper class providing a unified interface"""
     def __init__(self, model):
         super(ModelWrapper, self).__init__()
         self.model = model
@@ -336,27 +201,39 @@ class ModelWrapper(nn.Module):
     def compute_error_from_model(self, other):
         my_params, other_params = self.get_params(), other.get_params()
         with torch.no_grad():
-            error, total_num = 0.0, 0
+            error,total_num = 0.0, 0
             for p, q in zip(my_params, other_params):
                 error += torch.linalg.norm(p - q).pow(2).item()
                 total_num += np.prod(list(q.shape))
-            return error / total_num * 1e6
+            return error/total_num *1e6
 
 
 class ModelFactory:
-    """Model factory for creating specified models"""
     @staticmethod
     def create_model(config):
         model_name = config.model_name.lower()
         num_classes = config.num_classes
         img_size = config.img_size
-        pretrained = config.pretrained
-
+        dropout =  config.dropout
+        patch_size = config.patch_size
+        dim = config.dimhead
+        
         if model_name == 'cnn':
             model = CNN(num_classes=num_classes, img_size=img_size)
+        elif model_name == "resnet50":
+            model = ResNet50(num_classes=num_classes)
         elif model_name == 'vit':
-            patch_size = 4 if img_size == 32 else 8
-            model = ViT(num_classes=num_classes, img_size=img_size, patch_size=patch_size)
+            model = ViTRegular(
+                image_size = img_size,
+                patch_size = patch_size,
+                num_classes = num_classes,
+                dim = int(dim),
+                depth = 6,
+                heads = 8,
+                mlp_dim = 512,
+                dropout = dropout,
+                emb_dropout = dropout
+            )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
         
@@ -365,32 +242,7 @@ class ModelFactory:
 
 # ========== Dataset Loading ==========
 
-# This is the undefined ModelScopeDataset from cv.py, left for completeness
-# but not used by cifar10/tiny_imagenet.
-class ModelScopeDataset(Dataset):
-    def __init__(self, ms_dataset, transform=None):
-        self.data = list(ms_dataset)
-        self.transform = transform
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        image_path = item['image:FILE']
-        label = item['category']
-        # 'Image' is not defined/imported in the original script
-        # image = Image.open(image_path) 
-        # if image.mode != 'RGB':
-        #     image = image.convert('RGB')
-        # if self.transform:
-        #     image = self.transform(image)
-        # return image, label
-        raise NotImplementedError("ModelScopeDataset is not fully implemented or used.")
-
-
 def get_dataloaders(config):
-    """Load and return corresponding data loaders based on config"""
-    
-    # Set dataset-specific configs
     if config.dataset == 'cifar10':
         print("Loading CIFAR-10 dataset...")
         config.num_classes = 10
@@ -405,11 +257,8 @@ def get_dataloaders(config):
         
         if config.use_aug:
             print("Using train augmentations: RandomCrop(32, 4) and RandomHorizontalFlip")
-            # Insert augmentations at the beginning
             transform_train_list.insert(0, transforms.RandomHorizontalFlip())
             transform_train_list.insert(0, transforms.RandomCrop(32, padding=4))
-            # Note: RandAugment from train_cifar10.py is not available
-            # as the 'randomaug' import was not provided.
 
         transform_train = transforms.Compose(transform_train_list)
         transform_test = transforms.Compose([
@@ -419,39 +268,6 @@ def get_dataloaders(config):
         
         train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
         test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-
-    elif config.dataset == 'tiny_imagenet':
-        print("Loading Tiny ImageNet dataset...")
-        config.num_classes = 200
-        config.img_size = 64
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        
-        data_dir = '../.cache/huggingface/datasets/tiny-imagenet-200'
-        val_dir = '../.cache/huggingface/datasets/tiny-imagenet-200/val_structured'
-        
-        if not os.path.exists(val_dir):
-            raise FileNotFoundError("Tiny ImageNet validation set not found or prepared.")
-            
-        transform_train_list = [
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std)
-        ]
-        
-        if config.use_aug:
-            print("Using train augmentations: RandomRotation(20) and RandomHorizontalFlip")
-            transform_train_list.insert(0, transforms.RandomHorizontalFlip(0.5))
-            transform_train_list.insert(0, transforms.RandomRotation(20))
-            
-        transform_train = transforms.Compose(transform_train_list)
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std)
-        ])
-        
-        train_dataset = datasets.ImageFolder(os.path.join(data_dir, 'train'), transform_train)
-        test_dataset = datasets.ImageFolder(val_dir, transform_test)
-    
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset}")
 
@@ -487,15 +303,10 @@ def take_step(model, optimizer, criterion, dataloader, data_iter, device, step, 
     
     optimizer.zero_grad()
     
-    # --- AMP (autocast) Integration ---
-    # Forward pass with mixed precision
     with torch.cuda.amp.autocast(enabled=use_amp):
         outputs = model(images)
         loss = criterion(outputs, labels)
     
-    # Backward pass. 
-    # NOTE: We do not use GradScaler here because the optimizer.step()
-    # is performed on the main process, not in the worker.
     loss.backward()
     
     with torch.no_grad():
@@ -511,17 +322,29 @@ def take_step(model, optimizer, criterion, dataloader, data_iter, device, step, 
     }
 
 
-def run_worker(model, optimizer, criterion, dataloader, queues, device, seed_offset, use_amp):
+def run_worker(model, optimizer, criterion, dataloader, queues, device, seed_offset, use_amp, rank):
     data_iter = iter(dataloader)
+    
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+
     while True:
         ret = queues[0].get()
-        if ret is None:
+        if ret == 'FINISH':
+            if device.type == 'cuda':
+                peak_memory = torch.cuda.max_memory_allocated(device)
+            else:
+                peak_memory = 0 
+            
+            queues[2].put((rank, peak_memory))
             return
             
+        if ret is None:
+             return
+
         params, step = ret
         model.set_params(params, clone=False)
         
-        # Pass use_amp to take_step
         res = take_step(model, optimizer, criterion, dataloader, data_iter, device, step, seed_offset, use_amp)
         data_iter = res['data_iter']
         
@@ -540,84 +363,125 @@ def create_optimizer(model, config):
         return optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
     elif config.optimizer_type.lower() == 'adam':
         return optim.Adam(model.parameters(), lr=config.learning_rate)
-    else: # Default to adamw
+    else: 
         return optim.AdamW(model.parameters(), lr=config.learning_rate)
 
 
 def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv_logger):
     if config.device_count <= 1:
-        print("Only one GPU found, falling back to serial training.")
-        return train_loop_serial(config, model, criterion, train_loader, test_loader, csv_logger)
+        print("Error: Only one GPU found")
+        return
 
     mp.set_start_method('spawn', force=True)
-    queues = (mp.Queue(), mp.Queue())
+    queues = (mp.Queue(), mp.Queue(), mp.Queue())
     processes = []
+    
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(0)
+    
+
+    torch.cuda.reset_peak_memory_stats(0)
+    
 
     for rank in range(1, config.device_count):
         worker_device = torch.device(f"cuda:{rank}")
-        worker_model = ModelFactory.create_model(config).to(worker_device)
-        worker_optimizer = create_optimizer(worker_model, config)
+        model = model.to(worker_device)
+        worker_optimizer = create_optimizer(model, config)
             
         p = mp.Process(target=run_worker, args=(
-            worker_model, worker_optimizer, criterion, train_loader, 
-            queues, worker_device, config.seed, config.use_amp
+            model, worker_optimizer, criterion, train_loader, 
+            queues, worker_device, config.seed, config.use_amp, rank # 传入 rank
         ))
         p.start()
         processes.append(p)
 
-    device = torch.device("cuda:0")
     model = model.to(device)
-    
+    del worker_optimizer
     T = config.max_steps
     P = min(config.P, T)
-    thresh = config.threshold
     
     models = [None for _ in range(T + 1)]
     optimizers = [None for _ in range(T + 1)]
     
-    begin_idx, end_idx = 0, P
+    begin_idx = 0
+    end_idx = P
     total_iters, running_loss, running_correct, running_total, total_Grad = 0, 0.0, 0, 0, 0
     best_acc = 0.0
-    last_val_step = -config.val_interval # Ensure validation on first check if interval=0
-
-    for step in range(P + 1):
-        models[step] = model.clone(device)
-        optimizers[step] = create_optimizer(models[step], config)
+    last_val_step = -config.val_interval
+    thresh = config.threshold
+    accumulated_time = 0.0 
     
-    # --- LR Scheduler Integration ---
-    # Use optimizers[0] as the master for the scheduler
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizers[0], T_max=T)
-            
-    pbar = tqdm(total=T)
-    total_comm_time = 0.0
+    # --- RESUME LOGIC ---
+    resumed = False
+    if os.path.exists(config.resume_checkpoint_path):
+        print(f"Resuming from checkpoint: {config.resume_checkpoint_path}")
+        checkpoint = torch.load(config.resume_checkpoint_path)
+        
+        begin_idx = checkpoint['begin_idx']
+        end_idx = min(begin_idx + P, T)
+        total_iters = checkpoint['total_iters']
+        thresh = checkpoint['thresh']
+        running_loss = checkpoint['running_loss']
+        running_correct = checkpoint['running_correct']
+        running_total = checkpoint['running_total']
+        best_acc = checkpoint['best_acc']
+        last_val_step = checkpoint['last_val_step']
+        total_Grad = checkpoint['total_Grad']
+        
+        accumulated_time = checkpoint.get('accumulated_time', 0.0)
+        
+        model.model.load_state_dict(checkpoint['model_state_dict'])
+        models[begin_idx] = model.clone(device)
+        optimizers[begin_idx] = create_optimizer(models[begin_idx], config)
+        optimizers[begin_idx].load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        for step in range(begin_idx + 1, end_idx + 1):
+            models[step] = models[begin_idx].clone(device)
+            optimizers[step] = create_optimizer(models[step], config)
+            optimizer_state_clone(optimizers[begin_idx], optimizers[step])
+        
+        resumed = True
+    else:
+        for step in range(P + 1):
+            models[step] = model.clone(device)
+            optimizers[step] = create_optimizer(models[step], config)
+
+    # --- LR Scheduler ---
+    main_scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizers[begin_idx],
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=T
+    )
+
+    if resumed:
+        main_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    pbar = tqdm(total=T, initial=begin_idx)
+    
     start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start_event.record()
 
     while begin_idx < T:
-        # --- Time start ---
-        start_time_per_iter = time.time()
         parallel_len = end_idx - begin_idx
         pred_f = [None] * parallel_len
         metrics = [None] * parallel_len
 
-        # --- 1. Distribute tasks to worker processes ---
-        comm_start_time = time.time()
+        # 1. Distribute tasks
         for i in range(parallel_len):
             step = begin_idx + i
             params = [p.data for p in models[step].get_params()]
             queues[0].put((params, step))
 
-        # --- 2. Collect results from worker processes ---
+        # 2. Collect results
         for _ in range(parallel_len):
             _grads, _step, _metrics = queues[1].get()
             _i = _step - begin_idx
             pred_f[_i] = _grads
             metrics[_i] = _metrics
-        time_comm_per_iter = time.time() - comm_start_time
-        total_comm_time += time_comm_per_iter
 
-
-        # --- 3. Perform fixed-point iteration update ---
+        # 3. Fixed-point iteration
         rollout_model = models[begin_idx]
         rollout_optimizer = optimizers[begin_idx]
         ind, errors_all = None, 0
@@ -625,33 +489,26 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv
         for i in range(parallel_len):
             step = begin_idx + i
             
-            # --- LR Scheduler Integration ---
-            # Get current LR from main scheduler
             current_lr = main_scheduler.get_last_lr()[0]
-            # Manually set LR for the current rollout optimizer
             for param_group in rollout_optimizer.param_groups:
                 param_group['lr'] = current_lr
             
-            # Set gradients and perform step
             rollout_model.set_grads_from_grads(pred_f[i])
             rollout_optimizer.step()
             
-            # Step the main scheduler
             main_scheduler.step()
-            
-            rollout_optimizer.zero_grad()
-            
             error = rollout_model.compute_error_from_model(models[step + 1])
+            rollout_optimizer.zero_grad()
             
             if config.adaptivity_type == 'median' and i == parallel_len // 2:
                 errors_all = error
             elif config.adaptivity_type == 'mean':
                 errors_all += error / parallel_len
-
+            
             if ind is None and (error > thresh or i == parallel_len - 1):
                 ind = step + 1
                 optimizer_state_clone(rollout_optimizer, optimizers[step + 1])
-
+           
             if ind is None or step < ind:
                 running_loss += metrics[i]['loss']
                 running_correct += metrics[i]['correct']
@@ -662,14 +519,13 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv
             
             total_Grad += 1
 
-        # --- 4. Update error threshold ---
+        # 4. Update threshold
         thresh = thresh * config.ema_decay + errors_all * (1 - config.ema_decay)
         
-        # --- 5. Slide window ---
+        # 5. Slide window
         progress = ind - begin_idx
         pbar.update(progress)
         total_iters += 1
-        
         new_begin_idx = ind
         new_end_idx = min(new_begin_idx + parallel_len, T)
 
@@ -680,39 +536,35 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv
 
         begin_idx = new_begin_idx
         end_idx = new_end_idx
-        time_per_iter = time.time() - start_time_per_iter
-        time_comp_per_iter = time_per_iter - time_comm_per_iter
         
-        # --- 6. Log progress ---
+        # 6. Log progress
         accuracy = 100 * running_correct / running_total if running_total > 0 else 0
         avg_loss = running_loss / begin_idx if begin_idx > 0 else 0
         
         end_event.record()
         torch.cuda.synchronize()
-        elapsed = start_event.elapsed_time(end_event) / 1000.0
-        elapsed_str = str(timedelta(seconds=int(elapsed)))
+        current_session_time = start_event.elapsed_time(end_event) / 1000.0
+        total_elapsed_time = accumulated_time + current_session_time
+        elapsed_str = str(timedelta(seconds=int(total_elapsed_time)))
         
-        pbar.set_description(f'Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | Time: {elapsed_str}')
+        pbar.set_description(f'para Lr: {current_lr:.8f} | Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | Time: {elapsed_str}')
         
         csv_logger.log({
             "Iter": total_iters,
+            "Original_Steps": begin_idx,
+            "LR": current_lr,
             "Train_Loss": avg_loss,
             "Train_Acc": accuracy,
-            "Original_Steps": begin_idx,
-            "time_per_iter": time_per_iter,
-            "time_comm_per_iter": time_comm_per_iter,
-            "time_comp_per_iter": time_comp_per_iter,
-            "LR": current_lr
         })
         
-        # --- 7. Validation Logic ---
-        if begin_idx - last_val_step >= config.val_interval:
+        # 7. Validation Logic
+        if total_iters % config.val_interval == 0 or begin_idx == config.max_steps:
             last_val_step = begin_idx
-            current_model = models[begin_idx] # Model at the new window start
+            current_model = models[begin_idx]
             val_acc, val_metrics = evaluate_model(current_model, test_loader, device)
             
-            pbar.write(f"\n[Validation at step {begin_idx}] Test Acc: {val_acc:.2f}% | Best Acc: {best_acc:.2f}%")
-            
+            pbar.write(f"\n[Validation at para step {begin_idx}]|{config.model_name}|{config.dataset}|{config.optimizer_type}|{config.lr_scheduler_type}|{config.batch_size}|{config.learning_rate}| Test Acc: {val_acc:.2f}% | Best Acc: {best_acc:.2f}%")
+
             csv_logger.log({
                 "Iter": total_iters,
                 "Original_Steps": begin_idx,
@@ -727,20 +579,50 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv
                 pbar.write(f"Saving new best model to {config.checkpoint_dir}")
                 os.makedirs(config.checkpoint_dir, exist_ok=True)
                 torch.save(current_model.model.state_dict(), 
-                           os.path.join(config.checkpoint_dir, f"{config.model_name}_{config.dataset}_best.pth"))
+                               os.path.join(config.checkpoint_dir, f"{config.model_name}_{config.dataset}_best.pth"))
             
-            csv_logger.save() # Save intermediate logs
+            # Efficient Append Save
+            csv_logger.save()
 
+            # --- RESUME CHECKPOINT SAVE ---
+            resume_state = {
+                'begin_idx': begin_idx,
+                'total_iters': total_iters,
+                'thresh': thresh,
+                'running_loss': running_loss,
+                'running_correct': running_correct,
+                'running_total': running_total,
+                'best_acc': best_acc,
+                'last_val_step': last_val_step,
+                'total_Grad': total_Grad,
+                'model_state_dict': models[begin_idx].model.state_dict(),
+                'optimizer_state_dict': optimizers[begin_idx].state_dict(),
+                'scheduler_state_dict': main_scheduler.state_dict(),
+                'accumulated_time': total_elapsed_time 
+            }
+            torch.save(resume_state, config.resume_checkpoint_path)
 
     end_event.record()
     torch.cuda.synchronize()
-    elapsed = start_event.elapsed_time(end_event) / 1000.0
-    elapsed_str = str(timedelta(seconds=int(elapsed)))
+    current_session_time = start_event.elapsed_time(end_event) / 1000.0
+    total_elapsed_time = accumulated_time + current_session_time
+    elapsed_str = str(timedelta(seconds=int(total_elapsed_time)))
     pbar.close()
     
-    # Clean up worker processes
+    # --- Cleanup & Final Stats ---
+    peak_memories = {}
+    
     for _ in processes:
-        queues[0].put(None)
+        queues[0].put('FINISH')
+        
+    for _ in processes:
+        rank, peak_memory = queues[2].get()
+        peak_memories[f"GPU_{rank}_peak_memory_mb"] = peak_memory  / (1024 ** 2)
+        
+    peak_memories[f"GPU_0_peak_memory_MB"] = torch.cuda.max_memory_allocated(device)  / (1024 ** 2)
+    all_peak_values = [v for v in peak_memories.values()]
+    max_peak_mb = max(all_peak_values) if all_peak_values else 0
+
     for p in processes:
         p.join()
         
@@ -748,33 +630,36 @@ def train_loop_parallel(config, model, criterion, train_loader, test_loader, csv
     del models, optimizers
     final_accuracy, metrics = evaluate_model(final_model, test_loader, device)
     
-    upper_bound = total_iters * P
     m = total_Grad / T
     
-    # Log final metrics
-    csv_logger.log({"final_test_accuracy": final_accuracy,
-                    "final_test_precision":metrics["precision_macro"],
-                    "final_test_recall":metrics["recall_macro"],
-                    "final_test_f1-score":metrics["f1_macro"],
-                    "time":elapsed,
-                    "time_comm":total_comm_time,
-                    "time_step":elapsed - total_comm_time,
-                    "K":total_iters,
-                    "G":total_Grad,
-                    "upper_bound":upper_bound,
-                    "m":m
-                    })
+    log_data = {
+        "final_test_accuracy": final_accuracy,
+        "final_test_precision":metrics["precision_macro"],
+        "final_test_recall":metrics["recall_macro"],
+        "final_test_f1-score":metrics["f1_macro"],
+        "time": total_elapsed_time,
+        "K":total_iters,
+        "m":m,
+        "peak_memory_max_MB": max_peak_mb 
+    }
+    log_data.update(peak_memories) 
     
-    comm_time_str = str(timedelta(seconds=int(total_comm_time)))
+    csv_logger.log(log_data)
+    csv_logger.finish() # Flush last data
+    
     print(f"\nTraining completed in {elapsed_str}")
-    print(f"Total communication time: {comm_time_str}")
     print(f"Final test accuracy: {final_accuracy:.2f}%")
     print(f"Final test precision: {metrics['precision_macro']:.2f}%")
     print(f"Final test recall: {metrics['recall_macro']:.2f}%")
-    print(f"Final test f1-score: {metrics['f1_macro']:.2f}%")      
+    print(f"Final test f1-score: {metrics['f1_macro']:.2f}%")        
     print(f"Total iterations: {total_iters} (vs {T} normal iterations)")
     print(f"Effective speed-up: {T/total_iters:.2f}x")
+    print(f"Maximum GPU Peak Memory (across all cards): {max_peak_mb:.2f} MB")
     
+    if os.path.exists(config.resume_checkpoint_path):
+        print(f"Training complete. Removing resume checkpoint: {config.resume_checkpoint_path}")
+        os.remove(config.resume_checkpoint_path)
+
     return final_model
 
 
@@ -784,19 +669,48 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader, csv_l
     
     optimizer = create_optimizer(model, config)
     
-    # --- AMP (GradScaler) and LR Scheduler Integration ---
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+        peak_memory_max_mb = 0.0
+    
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.max_steps)
+    
+    scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=config.max_steps
+    )
 
-
-
-    start_time = time.time()
+    accumulated_time = 0.0
     running_loss, running_correct, running_total = 0.0, 0, 0
     best_acc = 0.0
-    pbar = tqdm(total=config.max_steps)
+    start_step = 0
+    
+    # --- RESUME LOGIC START ---
+    if os.path.exists(config.resume_checkpoint_path):
+        print(f"Resuming serial training from: {config.resume_checkpoint_path}")
+        checkpoint = torch.load(config.resume_checkpoint_path)
+        
+        start_step = checkpoint['step']
+        running_loss = checkpoint['running_loss']
+        running_correct = checkpoint['running_correct']
+        running_total = checkpoint['running_total']
+        best_acc = checkpoint['best_acc']
+        
+        accumulated_time = checkpoint.get('accumulated_time', 0.0) 
+        
+        model.model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    pbar = tqdm(total=config.max_steps, initial=start_step)
     data_iter = iter(train_loader)
     
-    for step in range(config.max_steps):
+    session_start_time = time.time()
+    
+    for step in range(start_step, config.max_steps):
         try:
             images, labels = next(data_iter)
         except StopIteration:
@@ -805,18 +719,15 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader, csv_l
             
         images, labels = images.to(device), labels.to(device)
         
-        # --- AMP (autocast) Integration ---
         with torch.cuda.amp.autocast(enabled=config.use_amp):
             outputs = model(images)
             loss = criterion(outputs, labels)
         
-        # --- GradScaler Integration ---
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        
-        # --- LR Scheduler Integration ---
+
         scheduler.step()
         
         with torch.no_grad():
@@ -827,28 +738,31 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader, csv_l
         running_correct += correct
         running_total += labels.size(0)
         
-        if (step + 1) % 5 == 0 or (step + 1) == config.max_steps:
-            avg_loss = running_loss / (step + 1)
-            avg_acc = 100 * running_correct / running_total
-            elapsed_str = str(timedelta(seconds=int(time.time() - start_time)))
-            current_lr = scheduler.get_last_lr()[0]
+        avg_loss = running_loss / (step + 1)
+        avg_acc = 100 * running_correct / running_total
+        
+        current_session_elapsed = time.time() - session_start_time
+        total_elapsed = accumulated_time + current_session_elapsed
+        elapsed_str = str(timedelta(seconds=int(total_elapsed)))
+        
+        current_lr = scheduler.get_last_lr()[0]
+        
+        csv_logger.log({
+            "Iter": step + 1,
+            "Original_Steps": step + 1,
+            "LR": current_lr,
+            "Train_Loss": avg_loss,
+            "Train_Acc": avg_acc,
+        })
             
-            csv_logger.log({
-                "Iter": step + 1,
-                "Train_Loss": avg_loss,
-                "Train_Acc": avg_acc,
-                "Original_Steps": step + 1,
-                "LR": current_lr
-            })
-            
-            pbar.set_description(f'Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}% | Time: {elapsed_str}')
+        pbar.set_description(f'serial Lr: {current_lr:.8f} |Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}% | Time: {elapsed_str}')
             
         pbar.update(1)
         
         # --- Validation Logic ---
         if (step + 1) % config.val_interval == 0 or (step + 1) == config.max_steps:
             val_acc, val_metrics = evaluate_model(model, test_loader, device)
-            pbar.write(f"\n[Validation at step {step+1}] Test Acc: {val_acc:.2f}% | Best Acc: {best_acc:.2f}%")
+            pbar.write(f"\n[Validation at serial step {step+1}]|{config.model_name}|{config.dataset}|{config.optimizer_type}|{config.lr_scheduler_type}|{config.batch_size}|{config.learning_rate}| Test Acc: {val_acc:.2f}% | Best Acc: {best_acc:.2f}%")
             
             csv_logger.log({
                 "Iter": step + 1,
@@ -863,26 +777,58 @@ def train_loop_serial(config, model, criterion, train_loader, test_loader, csv_l
                 pbar.write(f"Saving new best model to {config.checkpoint_dir}")
                 os.makedirs(config.checkpoint_dir, exist_ok=True)
                 torch.save(model.model.state_dict(), 
-                           os.path.join(config.checkpoint_dir, f"{config.model_name}_{config.dataset}_best.pth"))
+                               os.path.join(config.checkpoint_dir, f"{config.model_name}_{config.dataset}_best.pth"))
             
-            csv_logger.save() # Save intermediate logs
+            # Efficient Append Save
+            csv_logger.save()
+            
+            # --- RESUME CHECKPOINT SAVE ---
+            current_session_elapsed = time.time() - session_start_time
+            total_elapsed_for_save = accumulated_time + current_session_elapsed
+            
+            resume_state = {
+                'step': step + 1,
+                'running_loss': running_loss,
+                'running_correct': running_correct,
+                'running_total': running_total,
+                'best_acc': best_acc,
+                'accumulated_time': total_elapsed_for_save, 
+                'model_state_dict': model.model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+            }
+            torch.save(resume_state, config.resume_checkpoint_path)
         
     pbar.close()
     
-    elapsed = time.time() - start_time
+    current_session_elapsed = time.time() - session_start_time
+    total_elapsed = accumulated_time + current_session_elapsed
+    
     final_accuracy, metrics = evaluate_model(model, test_loader, device)
     
-    # Log final metrics
-    csv_logger.log({
+    if device.type == 'cuda':
+        peak_memory_bytes = torch.cuda.max_memory_allocated(device)
+        peak_memory_max_mb = peak_memory_bytes / (1024 ** 2)
+        print(f"Single GPU Peak Memory: {peak_memory_max_mb:.2f} MB")
+    
+    log_data = {
         "final_test_accuracy": final_accuracy, 
         "final_test_precision": metrics["precision_macro"], 
         "final_test_recall": metrics["recall_macro"], 
         "final_test_f1-score": metrics["f1_macro"], 
-        "time": elapsed
-    })
+        "time": total_elapsed,
+        "peak_memory_max_MB": peak_memory_max_mb if device.type == 'cuda' else 0.0
+    }
+    csv_logger.log(log_data)
+    csv_logger.finish()
     
-    print(f"\nTraining completed in {str(timedelta(seconds=int(elapsed)))}")
+    print(f"\nTraining completed in {str(timedelta(seconds=int(total_elapsed)))}")
     print(f"Final test accuracy: {final_accuracy:.2f}%")
+    
+    if os.path.exists(config.resume_checkpoint_path):
+        print(f"Training complete. Removing resume checkpoint: {config.resume_checkpoint_path}")
+        os.remove(config.resume_checkpoint_path)
     
     return model
 
@@ -929,20 +875,31 @@ def setup_arg_parser():
     parser.add_argument('--learning_rate', type=float, help='learning rate')
     parser.add_argument('--optimizer_type', type=str, choices=['sgd', 'adam', 'adamw'], help='optimizer type')
     parser.add_argument('--training_mode', type=str, choices=['parallel', 'serial'], help='training mode')
+    parser.add_argument('--dropout', type=float, default=0.0, help='dropout for vit')
+
+    # Scheduler parameters
+    parser.add_argument('--lr_scheduler_type', type=str, default='constant', 
+                        choices=['linear', 'cosine', 'constant'], 
+                        help='learning rate scheduler type')
+    parser.add_argument('--warmup_steps', type=int, default=0, help='number of warmup steps')
 
     # Parallel-specific parameters
     parser.add_argument('--P', type=int, help='window size')
     parser.add_argument('--threshold', type=float, help='threshold')
     parser.add_argument('--ema_decay', type=float, help='EMA decay for threshold')
     parser.add_argument('--adaptivity_type', type=str, choices=['mean', 'median'], help='error computation type')
-    
+       
     # Model and Dataset
     parser.add_argument('--model_name', type=str, 
-                        choices=['cnn', 'vit'], 
+                        choices=['cnn', 'vit', 'resnet50'], 
                         help='model to use')
     parser.add_argument('--pretrained', action='store_true', help='use pretrained model')
-    parser.add_argument('--dataset', type=str, choices=['cifar10', 'tiny_imagenet'], help='Dataset to use')
+    parser.add_argument('--dataset', type=str, choices=['cifar10'], help='Dataset to use')
     parser.add_argument('--num_classes', type=int, help='number of classes (auto-set by dataset)')
+    
+    # ViT specific
+    parser.add_argument('--patch', default=4, type=int, dest='patch_size', help="patch for ViT")
+    parser.add_argument('--dimhead', default=512, type=int, help="dimhead for ViT")
 
     # System and Logging
     parser.add_argument('--device_count', type=int, help='Number of CUDA devices to use')
@@ -956,7 +913,7 @@ def setup_arg_parser():
 
 
 def train_with_config(config=None, csv_logger=None):
-    if config is None:
+    if config == None:
         config = Config()
 
     # Set random seeds
@@ -965,35 +922,26 @@ def train_with_config(config=None, csv_logger=None):
     torch.cuda.manual_seed(config.seed)
     
     # --- Load Data and Set Steps ---
-    # get_dataloaders will update config.num_classes and config.img_size
     train_loader, test_loader = get_dataloaders(config)
     
-    # --- Epochs vs. Steps Logic ---
     if config.n_epochs is not None:
-        # Calculate max_steps from n_epochs
         config.max_steps = config.n_epochs * len(train_loader)
         print(f"Running for {config.n_epochs} epochs, calculated as {config.max_steps} total steps.")
     else:
-        # Calculate n_epochs from max_steps
         config.n_epochs = math.ceil(config.max_steps / len(train_loader))
         print(f"Running for {config.max_steps} steps, approximately {config.n_epochs} epochs.")
 
-    # Initialize CSV logger if not provided
     if csv_logger is None:
         csv_logger = CSVLogger()
     
-    # Create model and loss function
     model = ModelFactory.create_model(config)
     criterion = nn.CrossEntropyLoss()
     
-    # Start training
     print(f"Starting {config.training_mode} training...")
     if config.training_mode.lower() == "parallel":
         train_loop_parallel(config, model, criterion, train_loader, test_loader, csv_logger)
     else:
         train_loop_serial(config, model, criterion, train_loader, test_loader, csv_logger)
-    
-    csv_logger.finish()
 
 def main():
     parser = setup_arg_parser()
@@ -1002,16 +950,19 @@ def main():
     config = Config()
     config.update_from_args(args)
     
-    # Set up log directory
-    log_dir_base = args.log_dir if args.log_dir else "./new_exp_results"
+    log_dir_base = args.log_dir if args.log_dir else "./PASO_standard/2025_12_12_1_04"
     
-    # Build directory path
-    directory_path = os.path.join(
-        log_dir_base, config.dataset, config.model_name,
-        f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}"
-    )
+    if config.model_name in ['vit','vit_small']:
+        directory_path = os.path.join(
+            log_dir_base, config.dataset, config.model_name,
+            f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}_sched_{config.lr_scheduler_type}_warmup_{config.warmup_steps}_dropout_{config.dropout}"
+        )
+    else:
+        directory_path = os.path.join(
+            log_dir_base, config.dataset, config.model_name,
+            f"steps_{config.max_steps}_bs_{config.batch_size}_lr_{config.learning_rate}_optim_{config.optimizer_type}_sched_{config.lr_scheduler_type}_warmup_{config.warmup_steps}"
+        )
     
-    # Build filename
     if config.training_mode.lower() == 'parallel':
         output_csv = os.path.join(directory_path, 
             f"{config.training_mode}_{config.adaptivity_type}_P_{config.P}_tor_{config.threshold}_ema_{config.ema_decay}.csv")
@@ -1019,6 +970,9 @@ def main():
         output_csv = os.path.join(directory_path, f"{config.training_mode}.csv")
         
     print(f"Saving logs to: {output_csv}")
+
+    resume_checkpoint_filename = os.path.join(directory_path, f"{config.training_mode}_{config.adaptivity_type}_P_{config.P}_tor_{config.threshold}_ema_{config.ema_decay}"+"_resume_checkpoint.pth")
+    config.resume_checkpoint_path = resume_checkpoint_filename
 
     csv_logger = CSVLogger(output_csv)
     

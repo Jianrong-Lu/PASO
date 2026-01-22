@@ -1,126 +1,223 @@
-# PASO: Step-Parallel Training
 
-**PASO** is the first step-parallel training method based on equation system solving. By reformulating the optimization process as a fixed-point problem, PASO breaks the sequential dependency of standard optimizers, allowing for **significant acceleration in training** without sacrificing model accuracy.
 
------
+# PASO: Step Parallel Stochastic Optimization
 
-##  🖥️ Our Experiments Environments
-All experiments were conducted on a single high-performance computing node equipped with 8 NVIDIA A100 GPUs (80GB). The GPUs are interconnected via high-bandwidth NVLink and NVSwitch (fully connected topology). The software environment is standardized on Python 3.11, PyTorch 2.5.1, CUDA 12.1, and NCCL 2.21.5 running on Ubuntu 22.04.
+**PASO** is the first step-parallel training framework that breaks the sequential dependency of gradient descent without sacrificing model quality. By recasting training as a system of triangular nonlinear equations, PASO enables simultaneous gradient computation across multiple steps.
 
-## ⚡ Quick Start
 
-### 1\. Installation
 
-```bash
-pip install -r rq.txt
-```
 
-### 2\. Basic Verification (OptEx vs PASO)
-This script makes a comparison between OptEx and our PASO. For OptEx, we directly use their source code.
+## 🛠️ Environment & Installation
+
+All experiments were conducted on a single node with **8 NVIDIA A100 GPUs (80GB)**, utilizing NVLink for high-speed inter-GPU communication.
+
+* **OS:** Ubuntu 22.04
+* **Software:** Python 3.10, PyTorch 2.5.1, CUDA 12.1, NCCL 2.21.5
 
 ```bash
-python  optex_cmp.py
+pip install -r requirements.txt
+
 ```
 
------
+## 📊 Reproducibility Mapping
 
-## 🚀 Experiments
+The following table maps the scripts to the specific results presented in the paper.
 
-### 🖼️ Computer Vision (CIFAR-10)
+| Result | Task | Script | Table/Figure in Paper |
+| --- | --- | --- | --- |
+| **Synthetic Benchmarks** | Sphere, Ackley, Rosenbrock | `optex_cmp.py` | Table 15 in Appendix G |
+| **LLM (GPT-2)** | WikiText-2 | `llm.py` | Table 2 |
+| **LLM (Llama-3.2-1B)** | WikiText-2 | `llm.py` | Table 2 / Fig. 3 |
+| **Image Classification** | CIFAR-10 (ResNet50/ViT) | `cv.py` | Table 3 / Fig. 3 |
+| **Diffusion Training** | LSUN Church (UNet) | `diffusion.py` | Table 4 |
+| **FID Evaluation** | Diffusion Sampling | `sweep_fid.py` | Table 4 |
 
-#### A. High-Performance Version (`cv_v2.py`)
+---
 
-> **Note:** This version achieves high accuracy, comparable to community results from the reviewr provided link [vision-transformers-cifar10](https://www.google.com/search?q=//github.com/kentaroy47/vision-transformers-cifar10).
+## ⚡ Quick Start: Reproducing Results
 
-**Sequential Training (Baseline):**
+### 1. Verification (OptEx vs. PASO)  (Table 15 in Appendix G)
+
+This script compares PASO against the OptEx baseline on synthetic functions (Sphere, Ackley, Rosenbrock) to demonstrate superior speedup and convergence.
 
 ```bash
-python cv_v2.py --dataset cifar10 --model_name cnn --max_steps 60000 --batch_size 128 --learning_rate 0.001 --training_mode serial --optimizer_type adam
+python optex_cmp.py
 ```
 
-**PASO Training:**
+### 2. Image Classification (CIFAR-10)
+
+#### A. ResNet50 (Table 3)
+
+Run sequential baselines and PASO-accelerated versions using the exact parameters from the paper.
 
 ```bash
-python cv_v2.py --dataset cifar10 --model_name cnn --max_steps 60000 --batch_size 128 --learning_rate 0.001 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam
+# Serial Adam Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
+# Serial AdamW Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
+# Serial SGD Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+
+# Parallel Adam (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
+# Parallel AdamW (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
+# Parallel SGD (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+
 ```
 
-#### B. Memory-Efficient Distributed Version
-
-> **Note:** In this version, each GPU only needs to store one model and optimizer state.
+#### B. Vision Transformer (ViT) (Table 3)
 
 ```bash
-torchrun --nproc_per_node=8 --master_port=12345 cv_nccl.py
+# Serial Adam Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
+# Serial AdamW Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
+# Serial SGD Baseline
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+
+# Parallel Adam (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
+# Parallel AdamW (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
+# Parallel SGD (PASO)
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 ```
 
-#### C. Legacy Version (`cv_v1.py`)
+#### C. Memory-Efficient Distributed Version
 
-> **Note:** Older version with lower accuracy.
-
-**Sequential Training:**
+Utilizes NCCL for optimized cross-GPU weight synchronization. 
 
 ```bash
-python cv_v1.py --dataset cifar10 --model_name cnn --max_steps 60000 --batch_size 128 --learning_rate 0.001 --training_mode serial --optimizer_type adam
+torchrun --nproc_per_node=8 --master_port=12345 cv_nccl.py --training_mode parallel --P 7
 ```
 
-**PASO Training:**
+---
+
+### 3. LLM Tasks (WikiText-2)
+
+#### A. GPT-2 Training (Table 2 & 5)
+
+Reproduce results for varying window sizes and batch sizes.
 
 ```bash
-python cv_v1.py --dataset cifar10 --model_name cnn --max_steps 60000 --batch_size 128 --learning_rate 0.001 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam
+# Serial Adam/AdamW  Baseline
+python llm.py  --local_model_dir ./gpt2 --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 21 --optimizer_type adam/adamw --lr_scheduler_type constant
+# Parallel Adam/AdamW (PASO)
+python llm.py  --local_model_dir ./gpt2 --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adam/adamw --lr_scheduler_type constant
+
+# Serial SGD Baseline
+python llm.py --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-7 --ema_decay 0.9 --training_mode parallel --P 12 --optimizer_type sgd --lr_scheduler_type constant
+# Parallel Adam (PASO)
+python llm.py --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-7 --ema_decay 0.9 --training_mode parallel --P 12 --optimizer_type sgd --lr_scheduler_type constant
 ```
 
------
-
-### 📝 LLM Tasks (WikiText-2)
-
-#### A. High-Performance Version (`llm_v2.py`)
-
-> **Note:** This version achieves perplexity comparable to community results from the reivewer provided link [gpt2-finetuned-wikitext103](https://huggingface.co/neulab/gpt2-finetuned-wikitext103).
-
-**Sequential Training:**
+#### B. Llama-3.2-1B Training (Table 2)
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 35
+# Parallel AdamW/Adam/SGD (PASO)
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 14 --optimizer_type adamw --lr_scheduler_type cosine
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 14 --optimizer_type adam --lr_scheduler_type cosine
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 14 --optimizer_type sgd --lr_scheduler_type cosine
+
+
+# Serial AdamW/Adam/SGD Baseline
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 14 --optimizer_type adamw --lr_scheduler_type cosine
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 14 --optimizer_type adam --lr_scheduler_type cosine
+python llm.py --local_model_dir "./Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 1e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 14 --optimizer_type sgd --lr_scheduler_type cosine
 ```
 
-**PASO Training:**
+
+#### C. Impact of Window Size $p$
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.9 --training_mode serial --P 35
+# Parallel AdamW (PASO)
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 17 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 14 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 10 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adamw --lr_scheduler_type constant
+# Serial AdamW Baseline
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 21 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 17 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 14 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 10 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adamw --lr_scheduler_type constant
 ```
-**Naive Data-Parallel Training:**
+
+#### D. Impact of Batch Size $B$
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode navie_dp 
+# Parallel AdamW (PASO)
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 92 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 72 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 52 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adamw --lr_scheduler_type constant
+# Serial AdamW Baseline
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 25 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 92 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 25 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 72 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 25 --optimizer_type adamw --lr_scheduler_type constant
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 52 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 25 --optimizer_type adamw --lr_scheduler_type constant
 ```
 
-**Pytorch's Data-Parallel Training:**
+#### E. Data-parallelism Comparision (Table 6)
+
+Comparison against PyTorch DDP and DeepSpeed ZeRO-3.
 
 ```bash
-python llm_v2.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode ddp 
+# Adam Baseline
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --training_mode serial --optimizer_type adam --lr_scheduler_type constant
+# Step Parallelism w/o Optimization (PASO)
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 21 --optimizer_type adam --lr_scheduler_type constant
+# Data Parallelism w/o Optimization
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode naive_dp --optimizer_type adam --lr_scheduler_type constant
+# Data Parallelism w/ Full Optimization (Pytorch's DDP)
+python llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode ddp --optimizer_type adam --lr_scheduler_type constant
+# Data Parallelism w/ Full Optimization (DeepSpeed)
+deepspeed --num_gpus=8 llm.py  --local_model_dir "./gpt2" --modelscope_name "gpt2" --max_steps 1000 --batch_size 112 --learning_rate 6e-5  --training_mode deepspeed --optimizer_type adam --lr_scheduler_type constant --stage 3
 ```
 
-#### B. Legacy Version (`llm_v1.py`)
+---
 
-> **Note:** Older version with lower perplexity.
+### 4. Diffusion Models (LSUN Church)
 
-**Sequential Training:**
+#### A. UNet Training (Table 4)
 
 ```bash
-python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode serial --P 35
+# Serial Training (Adam Baseline)
+python diffusion.py --results_folder diffusion_v2_serial --dataset lsun_church --model_name unet --training_mode serial --lr_scheduler_type cosine --warmup_steps 10000 --save_and_sample_every 10000
+
+# Parallel Training (Adam + PASO)
+python diffusion.py --results_folder diffusion_v2_parallel --dataset lsun_church --model_name unet --threshold 0.000001 --paso_ema_decay 0.99 --training_mode parallel --P 7 --lr_scheduler_type cosine --warmup_steps 10000 --save_and_sample_every 10000
 ```
 
-**PASO Training:**
+#### B. FID Evaluation
+
+Generate 50k samples and calculate the Fréchet Inception Distance.
 
 ```bash
-python llm_v1.py --local_model_dir "./model/LLM-Research/Llama-3.2-1B" --modelscope_name "Llama-3.2-1B" --max_steps 1000 --batch_size 30 --learning_rate 6e-5 --threshold 1e-5 --ema_decay 0.999 --training_mode parallel --P 35
+# Parallel Mode FID Calculation
+python sweep_fid.py --results_folder ./PASO/diffusion_v2_parallel --data_folder ./dataset/church_outdoor_images --milestones 10000 50000 100000 150000 200000 250000 300000 350000 400000 450000 500000 550000 600000 --csv_name parallel_fid.csv --batch_size 512 --num_samples 50000
+
+# Serial Mode FID Calculation
+python sweep_fid.py --results_folder ./PASO/diffusion_v2_serial --data_folder ./dataset/church_outdoor_images --milestones 10000 50000 100000 150000 200000 250000 300000 350000 400000 450000 500000 550000 600000 --csv_name serial_fid.csv --batch_size 512 --num_samples 50000
 ```
 
------
+---
 
-## 📊 Visualization
+## 📈 Visualization
 
-Use the plotting script to visualize and compare training metrics (e.g., Loss, Accuracy).
+Use the provided script to compare the accuracy, loss, FID, and perplerxity curves between serial and PASO methods.
 
 ```bash
-python plot.py --csv_path1 "Path to the first CSV file (will be labeled 'AdamW')." --csv_path2 "Path to the second CSV file (will be labeled 'ParaAdamW')." --column_name "Name of the column to plot (e.g., Train_Loss, Train_Acc, final_test_accuracy, etc.)."
+python plot_compare.py --column_name Val_Acc --type acc_ites --x_interval 10000 --y_interval 20 --y_min 0.0 --csv_path1 /patah/to/serial_results.csv --csv_path2 /patah/to/parallel_results.csv
 ```
+
+For example, to plot the accuracy curve w.r.t iteration:
+
+```bash
+python plot_compare.py --column_name Val_Acc --type acc_ites --x_interval 10000 --y_interval 20 --y_min 0.0  ./PASO_standard/2025_12_12_1_04/cifar10/vit/steps_100000_bs_2048_lr_0.00015_optim_adamw_sched_cosine_warmup_10000_dropout_0.0/serial.csv ./PASO_standard/2025_12_12_1_04/cifar10/vit/steps_100000_bs_2048_lr_0.00015_optim_adamw_sched_cosine_warmup_10000_dropout_0.0/parallel_median_P_7_tor_0.1_ema_0.999.csv 
+```
+
+
