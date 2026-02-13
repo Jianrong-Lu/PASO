@@ -21,13 +21,13 @@ Official implementation of "PASO: Step Parallel Stochastic Optimization"
 ### 🌀 Workflow Overview
 The following diagram illustrates how PASO parallelizes the traditionally sequential training steps:
 
-![Process Visualization](./assets/VisionCMP_final.gif)
+<!-- ![Process Visualization](./assets/VisionCMP_final.gif) -->
 
-![Method Overview](./assets/method_image.jpg)
+![Method Overview](./assets/paso_idea_figure.png)
 
 ### 📈 Experimental Results
-
-![Stable Diffusion Results](./assets/SD_Table.jpg)
+Quantitative comparisons of different methods on WiKiText-2, where models are initialized from pre-trained weights. The best results are highlighted in bold. $\uparrow$ (resp. $\downarrow$) means the larger (resp. smaller), the better. We define tokens as totally consumed tokens by the model. Memory (Mem.) refers to the peak GPU memory allocated during training. We report the mean and standard deviation across 5 runs.
+![LLM Traning Results](./assets/results_on_LLM_task.png) 
 
 ## 🛠️ Environment & Installation
 
