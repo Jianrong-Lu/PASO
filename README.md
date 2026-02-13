@@ -1,11 +1,33 @@
 
 
-# PASO: Step Parallel Stochastic Optimization
 
-**PASO** is the first step-parallel training framework that breaks the sequential dependency of gradient descent without sacrificing model quality. By recasting training as a system of triangular nonlinear equations, PASO enables simultaneous gradient computation across multiple steps.
+<p align="center">
+  <h1 align="center">PASO: Step Parallel Stochastic Optimization</h1>
+
+  <p align="center">
+    <br />
+    <strong>Anonymous Repository</strong></a>
+  </p>
+</p>
 
 
+Official implementation of "PASO: Step Parallel Stochastic Optimization" 
 
+
+# PASO Introdction
+
+**PASO** is **the first step-parallel training framework** that breaks the sequential dependency of gradient descent without sacrificing model quality. By recasting training as a system of triangular nonlinear equations, PASO enables simultaneous gradient computation across multiple steps.
+
+### 🌀 Workflow Overview
+The following diagram illustrates how PASO parallelizes the traditionally sequential training steps:
+
+![Process Visualization](./assets/VisionCMP_final.gif)
+
+![Method Overview](./assets/method_image.jpg)
+
+### 📈 Experimental Results
+
+![Stable Diffusion Results](./assets/SD_Table.jpg)
 
 ## 🛠️ Environment & Installation
 
