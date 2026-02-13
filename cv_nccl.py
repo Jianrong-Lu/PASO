@@ -414,7 +414,7 @@ class PASOOptimizer:
 
 class Config:
     max_steps: int = 60000
-    learning_rate: float = 0.001
+    learning_rate: float = 0.00085
     batch_size: int = 4096
     threshold: float = 0.001
     ema_decay: float = 0.999

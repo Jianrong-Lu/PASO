@@ -112,7 +112,7 @@ python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_
 Utilizes NCCL for optimized cross-GPU weight synchronization. 
 
 ```bash
-torchrun --nproc_per_node=8 --master_port=12345 cv_nccl.py --training_mode parallel --P 7
+torchrun --nproc_per_node=8 --master_port=12345 cv_nccl.py
 ```
 
 ---
