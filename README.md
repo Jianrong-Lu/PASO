@@ -2,7 +2,7 @@
 
 
 <p align="center">
-  <h1 align="center">PASO: Step Parallel Stochastic Optimization</h1>
+  <h1 align="center">[ICML 2026] PASO: Step Parallel Stochastic Optimization</h1>
 
   <p align="center">
     <br />
