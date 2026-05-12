@@ -55,6 +55,9 @@ class MemTracker:
         allocated = torch.cuda.memory_allocated()
         reserved = torch.cuda.memory_reserved()
         peak = torch.cuda.max_memory_allocated()
+        free_b, total_b = torch.cuda.mem_get_info()
+        nvsmi = total_b - free_b
+        untracked = nvsmi - reserved
         delta = allocated - self._last_allocated
         cumulative = allocated - self._baseline
         row = {
@@ -64,6 +67,8 @@ class MemTracker:
             "cumulative_MB": cumulative / 1024**2,
             "reserved_MB": reserved / 1024**2,
             "peak_MB": peak / 1024**2,
+            "nvsmi_MB": nvsmi / 1024**2,
+            "untracked_MB": untracked / 1024**2,
         }
         self.history.append(row)
         self._last_allocated = allocated
@@ -71,25 +76,27 @@ class MemTracker:
             print(
                 f"[MEM serial] {tag:<55} "
                 f"alloc={row['allocated_MB']:>9.2f}MB  "
-                f"Δ={row['delta_MB']:>+9.2f}MB  "
-                f"cum={row['cumulative_MB']:>+9.2f}MB  "
-                f"peak={row['peak_MB']:>9.2f}MB"
+                f"peak={row['peak_MB']:>9.2f}MB  "
+                f"reserved={row['reserved_MB']:>9.2f}MB  "
+                f"nvsmi={row['nvsmi_MB']:>9.2f}MB  "
+                f"untracked={row['untracked_MB']:>+9.2f}MB"
             )
 
     def report(self):
-        print("\n" + "=" * 110)
+        print("\n" + "=" * 140)
         print("MEMORY REPORT (single-GPU serial baseline)")
-        print("=" * 110)
+        print("=" * 140)
         print(
-            f"{'Stage':<55} | {'Alloc(MB)':>10} | {'Delta(MB)':>10} | {'Cum(MB)':>10} | {'Peak(MB)':>10}"
+            f"{'Stage':<55} | {'Alloc(MB)':>10} | {'Peak(MB)':>10} | "
+            f"{'Reserved(MB)':>12} | {'nvsmi(MB)':>10} | {'Untracked(MB)':>13}"
         )
-        print("-" * 110)
+        print("-" * 140)
         for h in self.history:
             print(
-                f"{h['tag']:<55} | {h['allocated_MB']:>10.2f} | {h['delta_MB']:>+10.2f} | "
-                f"{h['cumulative_MB']:>+10.2f} | {h['peak_MB']:>10.2f}"
+                f"{h['tag']:<55} | {h['allocated_MB']:>10.2f} | {h['peak_MB']:>10.2f} | "
+                f"{h['reserved_MB']:>12.2f} | {h['nvsmi_MB']:>10.2f} | {h['untracked_MB']:>+13.2f}"
             )
-        print("=" * 110)
+        print("=" * 140)
 
 
 # ---- CNN, Config, set_seed: identical to cv_nccl_profile.py / cv_nccl.py ----
@@ -213,6 +220,21 @@ def main():
             tracker.checkpoint("after first forward+backward (pre-step)")
 
         optimizer.step()
+
+        # Per-iter nvsmi sample: matches the per-iter probe in cv_nccl_profile.py
+        # so the two logs can be diffed directly.
+        torch.cuda.synchronize()
+        free_b, total_b = torch.cuda.mem_get_info()
+        nvsmi_mb = (total_b - free_b) / 1024**2
+        peak_mb = torch.cuda.max_memory_allocated() / 1024**2
+        reserved_mb = torch.cuda.memory_reserved() / 1024**2
+        untracked_mb = nvsmi_mb - reserved_mb
+        print(
+            f"[NV iter={step + 1:>4d}] nvsmi={nvsmi_mb:>9.1f}MB  "
+            f"peak={peak_mb:>9.1f}MB  reserved={reserved_mb:>9.1f}MB  "
+            f"untracked={untracked_mb:>+9.1f}MB",
+            flush=True,
+        )
 
         if step == 0:
             # AdamW lazily allocates exp_avg + exp_avg_sq on first step().
