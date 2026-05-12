@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-PROFILE_NUM_STEPS = 5
+PROFILE_NUM_STEPS = 100
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_rank{rank}.pickle"
 
@@ -563,8 +563,8 @@ def main():
 
         if it == 0:
             tracker.checkpoint("after FIRST multi_step (NCCL collectives active)")
-        elif it == PROFILE_NUM_STEPS - 1:
-            tracker.checkpoint(f"after multi_step #{it + 1} (steady)")
+        elif it + 1 in {10, 50, 100, 500, 1000, PROFILE_NUM_STEPS}:
+            tracker.checkpoint(f"after multi_step #{it + 1}")
 
     dist.barrier()
     tracker.checkpoint("end (post barrier)")

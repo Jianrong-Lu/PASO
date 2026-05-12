@@ -32,7 +32,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 
-PROFILE_NUM_STEPS = 5
+PROFILE_NUM_STEPS = 100
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_serial.pickle"
 
@@ -216,8 +216,8 @@ def main():
             # This is the REAL optimizer-state footprint to compare against
             # NCCL's (D) 4x pre-allocated states.
             tracker.checkpoint("after first optimizer.step() (Adam state alloc'd)")
-        elif step == PROFILE_NUM_STEPS - 1:
-            tracker.checkpoint(f"after step #{step + 1} (steady)")
+        elif step + 1 in {10, 50, 100, 500, 1000, PROFILE_NUM_STEPS}:
+            tracker.checkpoint(f"after step #{step + 1}")
 
     tracker.checkpoint("end")
     tracker.report()
