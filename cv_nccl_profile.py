@@ -570,21 +570,6 @@ def main():
         completed_steps += progress
         total_iters += 1
 
-        # Per-iter nvsmi sample: catches leaks outside PyTorch's allocator.
-        if rank == 0:
-            torch.cuda.synchronize()
-            free_b, total_b = torch.cuda.mem_get_info()
-            nvsmi_mb = (total_b - free_b) / 1024**2
-            peak_mb = torch.cuda.max_memory_allocated() / 1024**2
-            reserved_mb = torch.cuda.memory_reserved() / 1024**2
-            untracked_mb = nvsmi_mb - reserved_mb
-            print(
-                f"[NV iter={it + 1:>4d}] nvsmi={nvsmi_mb:>9.1f}MB  "
-                f"peak={peak_mb:>9.1f}MB  reserved={reserved_mb:>9.1f}MB  "
-                f"untracked={untracked_mb:>+9.1f}MB",
-                flush=True,
-            )
-
         if it == 0:
             tracker.checkpoint("after FIRST multi_step (NCCL collectives active)")
         elif it + 1 in {10, 50, 100, 500, 1000, PROFILE_NUM_STEPS}:

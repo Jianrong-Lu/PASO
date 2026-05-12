@@ -221,21 +221,6 @@ def main():
 
         optimizer.step()
 
-        # Per-iter nvsmi sample: matches the per-iter probe in cv_nccl_profile.py
-        # so the two logs can be diffed directly.
-        torch.cuda.synchronize()
-        free_b, total_b = torch.cuda.mem_get_info()
-        nvsmi_mb = (total_b - free_b) / 1024**2
-        peak_mb = torch.cuda.max_memory_allocated() / 1024**2
-        reserved_mb = torch.cuda.memory_reserved() / 1024**2
-        untracked_mb = nvsmi_mb - reserved_mb
-        print(
-            f"[NV iter={step + 1:>4d}] nvsmi={nvsmi_mb:>9.1f}MB  "
-            f"peak={peak_mb:>9.1f}MB  reserved={reserved_mb:>9.1f}MB  "
-            f"untracked={untracked_mb:>+9.1f}MB",
-            flush=True,
-        )
-
         if step == 0:
             # AdamW lazily allocates exp_avg + exp_avg_sq on first step().
             # This is the REAL optimizer-state footprint to compare against
