@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-PROFILE_NUM_STEPS = 100
+PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 100))
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_rank{rank}.pickle"
 
@@ -541,6 +541,8 @@ def main():
 
     # --- run a few iterations to see first-collective and steady-state ---
     completed_steps, total_iters = 0, 0
+    torch.cuda.synchronize()
+    loop_start_time = time.time()
     for it in range(PROFILE_NUM_STEPS):
         begin_idx, rank_order = paso_opt.get_step_indices()
         local_metrics = (0.0, 0, 0)
@@ -567,8 +569,22 @@ def main():
             tracker.checkpoint(f"after multi_step #{it + 1}")
 
     dist.barrier()
+    torch.cuda.synchronize()
+    loop_elapsed = time.time() - loop_start_time
     tracker.checkpoint("end (post barrier)")
     tracker.report()
+
+    if rank == 0:
+        per_iter_ms = loop_elapsed / PROFILE_NUM_STEPS * 1000
+        per_step_ms = (loop_elapsed / completed_steps * 1000) if completed_steps else float("nan")
+        print(
+            f"\n[TIME rank=0] world_size={world_size}  "
+            f"PROFILE_NUM_STEPS={PROFILE_NUM_STEPS}  "
+            f"total_loop={loop_elapsed:.2f}s  "
+            f"per_iter={per_iter_ms:.2f}ms  "
+            f"completed_steps={completed_steps}  "
+            f"per_completed_step={per_step_ms:.2f}ms"
+        )
 
     if PROFILE_DUMP_SNAPSHOT:
         path = SNAPSHOT_PATH.format(rank=rank)

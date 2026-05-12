@@ -23,6 +23,7 @@ Stages are intentionally named to mirror the NCCL profile where possible:
 
 import os
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,7 +33,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 
-PROFILE_NUM_STEPS = 100
+PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 100))
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_serial.pickle"
 
@@ -193,6 +194,8 @@ def main():
     criterion = nn.CrossEntropyLoss()
     data_iter = iter(raw_loader)
 
+    torch.cuda.synchronize()
+    loop_start_time = time.time()
     for step in range(PROFILE_NUM_STEPS):
         try:
             inputs, labels = next(data_iter)
@@ -219,8 +222,18 @@ def main():
         elif step + 1 in {10, 50, 100, 500, 1000, PROFILE_NUM_STEPS}:
             tracker.checkpoint(f"after step #{step + 1}")
 
+    torch.cuda.synchronize()
+    loop_elapsed = time.time() - loop_start_time
     tracker.checkpoint("end")
     tracker.report()
+
+    per_iter_ms = loop_elapsed / PROFILE_NUM_STEPS * 1000
+    print(
+        f"\n[TIME serial] world_size=1  "
+        f"PROFILE_NUM_STEPS={PROFILE_NUM_STEPS}  "
+        f"total_loop={loop_elapsed:.2f}s  "
+        f"per_iter={per_iter_ms:.2f}ms"
+    )
 
     if PROFILE_DUMP_SNAPSHOT:
         torch.cuda.memory._dump_snapshot(SNAPSHOT_PATH)
