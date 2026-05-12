@@ -102,22 +102,31 @@ class Config:
 
 
 class CNN(nn.Module):
-    def __init__(self):
+    """Scaled CNN. Mirrors cv_nccl_profile.py for direct subtraction.
+
+    Layout: conv → conv → flatten → Linear(4096, W) → fc_layers × Linear(W, W) → Linear(W, 10)
+    fc_width=128, fc_layers=0 reproduces the original ~545K-param model.
+    """
+
+    def __init__(self, fc_width: int = 128, fc_layers: int = 0):
         super(CNN, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
         self.relu = nn.ReLU()
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = nn.Linear(128, 10)
+
+        in_dim = 64 * 8 * 8
+        fc_modules = [nn.Linear(in_dim, fc_width), nn.ReLU()]
+        for _ in range(fc_layers):
+            fc_modules += [nn.Linear(fc_width, fc_width), nn.ReLU()]
+        fc_modules.append(nn.Linear(fc_width, 10))
+        self.fc = nn.Sequential(*fc_modules)
 
     def forward(self, x):
         x = self.pool(self.relu(self.conv1(x)))
         x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(-1, 64 * 8 * 8)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
 
 
 def set_seed(seed: int):
@@ -166,7 +175,14 @@ def main():
     tracker.checkpoint("data loaded (CPU; should be ~0)")
 
     # --- (A) model on GPU --- matches NCCL stage (A)
-    model = CNN().to(device)
+    fc_width = int(os.environ.get("CNN_FC_WIDTH", 128))
+    fc_layers = int(os.environ.get("CNN_FC_LAYERS", 0))
+    model = CNN(fc_width=fc_width, fc_layers=fc_layers).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"[CNN cfg] fc_width={fc_width}  fc_layers={fc_layers}  "
+        f"total_params={n_params:,}  fp32_size={n_params * 4 / 1024**2:.2f}MB"
+    )
     tracker.checkpoint("(A) model on GPU")
 
     # --- AdamW constructed --- matches NCCL "AdamW constructed"
