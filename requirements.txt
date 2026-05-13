@@ -1,9 +1,7 @@
-python==3.10.13
 pytorch-fid==0.3.0
 accelerate==1.7.0
 datasets==3.6.0
 einops==0.8.1
-pytorch==1.14.2
 matplotlib==3.10.7
 modelscope==1.27.0
 numpy==2.2.6
