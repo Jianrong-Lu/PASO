@@ -33,7 +33,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 
-PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 100))
+PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 5))
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_serial.pickle"
 

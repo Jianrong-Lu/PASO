@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 100))
+PROFILE_NUM_STEPS = int(os.environ.get("PROFILE_NUM_STEPS", 5))
 PROFILE_DUMP_SNAPSHOT = True
 SNAPSHOT_PATH = "./mem_snapshot_rank{rank}.pickle"
 
