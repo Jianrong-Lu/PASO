@@ -107,13 +107,7 @@ python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 ```
 
-#### C. Memory-Efficient Distributed Version
 
-Utilizes NCCL for optimized cross-GPU weight synchronization. 
-
-```bash
-torchrun --nproc_per_node=8 --master_port=12345 cv_nccl.py
-```
 
 ---
 
