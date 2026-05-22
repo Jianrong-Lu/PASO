@@ -78,14 +78,14 @@ python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_
 # Serial AdamW Baseline
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
 # Serial SGD Baseline
-python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 240000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 
 # Parallel Adam (PASO)
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
 # Parallel AdamW (PASO)
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
 # Parallel SGD (PASO)
-python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 240000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 
 ```
 
@@ -97,14 +97,14 @@ python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_
 # Serial AdamW Baseline
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
 # Serial SGD Baseline
-python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 240000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode serial --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 
 # Parallel Adam (PASO)
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adam --lr_scheduler_type cosine --warmup_steps 10000
 # Parallel AdamW (PASO)
 python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type adamw --lr_scheduler_type cosine --warmup_steps 10000
 # Parallel SGD (PASO)
-python cv.py --dataset cifar10 --model_name resnet50 --max_steps 100000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
+python cv.py --dataset cifar10 --model_name resnet50 --max_steps 240000 --batch_size 2048 --learning_rate 0.00005 --threshold 0.1 --ema_decay 0.999 --training_mode parallel --P 7 --optimizer_type sgd --lr_scheduler_type cosine --warmup_steps 10000
 ```
 
 
