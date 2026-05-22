@@ -5,11 +5,10 @@
   <h1 align="center">[ICML 2026] PASO: Step Parallel Stochastic Optimization</h1>
 
   <p align="center">
+    <strong>Jianrong Lu, Zhuoya Gu, Haobo Li, Zhiyu Zhu, Yechao Zhang, Jianhai Chen, Minghui Yang, Junwei Liu, Jian Wang, Qinming He, Hui Liu, Junhui Hou</strong>
     <br />
-    <strong>Anonymous Repository</strong></a>
   </p>
 </p>
-
 
 Official implementation of "PASO: Step Parallel Stochastic Optimization" 
 
